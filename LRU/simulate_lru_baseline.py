@@ -8,25 +8,8 @@ from typing import Any, Dict, List, Tuple
 
 import pandas as pd
 
-from Cache_System_Workflow.sabre_cache_workflow_v2 import RequestContext
+from Cache_System_Workflow.sabre_cache_workflow_v2 import RequestContext, TruthPriceProvider
 from data_processing.pipeline import DataPipelineProcessor
-
-
-class DemoProvider:
-    def __init__(self) -> None:
-        self.calls = 0
-
-    def __call__(self, request: RequestContext) -> Dict[str, Any]:
-        self.calls += 1
-        base_price = 120 + (self.calls * 7)
-        return {
-            "request_key": request.cache_key(),
-            "provider_call": self.calls,
-            "offers": [
-                {"hotel_id": "H100", "price": float(base_price)},
-                {"hotel_id": "H210", "price": float(base_price + 25)},
-            ],
-        }
 
 
 class _Tee:
@@ -59,7 +42,7 @@ class VanillaLRUCache:
         self.misses = 0
         self.evictions = 0
 
-    def get(self, request: RequestContext, provider: DemoProvider) -> LRUResult:
+    def get(self, request: RequestContext, provider: TruthPriceProvider) -> LRUResult:
         key = request.cache_key()
         if key in self._store:
             self.hits += 1
@@ -145,7 +128,7 @@ def run_simulation(
     partition_date: str = "2026-02-07",
     max_requests: int | None = None,
 ) -> None:
-    provider = DemoProvider()
+    provider = TruthPriceProvider(truth_price_by_key={})
     lru = VanillaLRUCache(capacity=1000)
 
     requests = _load_requests_from_partition(partition_date=partition_date, max_requests=max_requests)
@@ -220,4 +203,3 @@ if __name__ == "__main__":
     run_simulation()
 
 
-#  "from simulate_lru_baseline import run_simulation; run_simulation(output_path='simulation_output_lru_2026-02-07_3000.txt', partition_date='2026-02-07', max_requests=3000)"

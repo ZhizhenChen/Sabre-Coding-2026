@@ -7,7 +7,7 @@ set -e
 
 # Default values
 PARTITION_DATE="2026-02-07"
-MAX_REQUESTS=10000000
+MAX_REQUESTS=3000
 OUTPUT_PATH="workflow_ttl_methods_eval_$(date +%Y-%m-%d_%H%M%S).txt"
 CONTROLLED_CAPACITY=100
 UNCONTROLLED_CAPACITY=900
