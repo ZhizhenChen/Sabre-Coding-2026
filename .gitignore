@@ -1,8 +1,11 @@
 # macOS
 .DS_Store
+._*
+.___*
 
 # Python
 __pycache__/
+.___pycache__/
 *.py[cod]
 *$py.class
 *.so

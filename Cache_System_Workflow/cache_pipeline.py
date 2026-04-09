@@ -16,7 +16,16 @@ import numpy as np
 import pandas as pd
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
-LAMBDA_DIR = ROOT_DIR / "lambda"
+
+
+def _resolve_case_dir(preferred: str, fallback: str) -> Path:
+    p = ROOT_DIR / preferred
+    if p.exists():
+        return p
+    return ROOT_DIR / fallback
+
+
+LAMBDA_DIR = _resolve_case_dir("Lambda", "lambda")
 LRU_DIR = ROOT_DIR / "LRU"
 
 if str(ROOT_DIR) not in sys.path:
@@ -248,6 +257,8 @@ def _prepare_requests(requests_df: pd.DataFrame, p_reuse_df: pd.DataFrame) -> Li
         .mean()
     )
     merged = requests_df.merge(p_lookup, on=["cache_key"], how="left")
+    merged["rq_timestamp"] = pd.to_datetime(merged["rq_timestamp"], errors="coerce", utc=True)
+    merged = merged.dropna(subset=["rq_timestamp"]).sort_values("rq_timestamp", kind="stable").reset_index(drop=True)
     merged["p_reuse"] = merged["p_reuse"].fillna(0.5)
 
     prepared: List[PreparedWorkflowInput] = []
@@ -276,7 +287,7 @@ def _run_ttl_method(
     requests_df: pd.DataFrame,
     prepared_requests: List[PreparedWorkflowInput],
     ttl_lookup_by_bucket: Dict[str, int],
-    truth_price_by_key: Dict[str, float],
+    truth_price_by_key: Dict[str, List[Dict[str, Any]]],
     lru_provider_calls: int,
     controlled_capacity: int = 100,
     uncontrolled_capacity: int = 900,
@@ -296,8 +307,11 @@ def _run_ttl_method(
         km_ttl_lookup_by_bucket=ttl_lookup_by_bucket,
     )
 
-    candidate_tuples = [(item.request, item.p_reuse, item.lambda_i) for item in prepared_requests]
-    prefetched_keys = workflow.prefetch_controlled(candidate_tuples, provider)
+    # Causal prewarming only: use candidates observed up to current replay time.
+    # This avoids leaking future requests into prewarm decisions.
+    prefetched_keys: set[str] = set()
+    seen_candidates: Dict[str, Tuple[RequestContext, float, float]] = {}
+    prefetch_every = max(25, int(max(1, controlled_capacity) * max(0.01, prefetch_ratio)))
 
     hit_count = 0
     miss_count = 0
@@ -329,11 +343,19 @@ def _run_ttl_method(
         else:
             miss_count += 1
 
+        prev = seen_candidates.get(key)
+        if prev is None or float(item.p_reuse) > float(prev[1]):
+            seen_candidates[key] = (item.request, float(item.p_reuse), float(item.lambda_i))
+
+        if idx % prefetch_every == 0 and seen_candidates:
+            admitted = workflow.prefetch_controlled(list(seen_candidates.values()), provider)
+            prefetched_keys.update(admitted)
+
     total_requests = len(prepared_requests)
     unique_keys = len({item.request.cache_key() for item in prepared_requests})
     hit_rate = hit_count / total_requests if total_requests else 0.0
 
-    useful_prewarm = len(set(prefetched_keys) & hit_keys)
+    useful_prewarm = len(prefetched_keys & hit_keys)
     total_prewarm = len(prefetched_keys)
     prewarm_precision = useful_prewarm / total_prewarm if total_prewarm else 0.0
 

@@ -66,7 +66,7 @@ class RequestContext:
         if self.cache_key_value:
             return self.cache_key_value
         return (
-            f"{self.hotel_code}::"
+            f"{self.chain_code}::"
             f"{self.city_code}::"
             f"{self.stay_start_date}::"
             f"{self.stay_end_date}"
