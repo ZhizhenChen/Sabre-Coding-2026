@@ -1,0 +1,46 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDE / editor
+.vscode/
+*.code-workspace
+
+# Runtime / logs
+*.log
+
+# Generated evaluation and simulation outputs
+workflow_ttl_methods_eval_*.txt
+distribution_summary.txt
+distribution_testing.py
+distribution_analysis.png
+*_smoke*.txt
+simulation_output_*.txt
+
+# Optional: large local datasets (uncomment if needed)
+data/cleaned_partitioned/
+data/dfw_hotel_data_jul_feb/
+data/nyc_hotel_data_jul_feb/
+
+# Ignore legacy workflow implementation
+Cache_System_Workflow/sabre_cache_workflow.py
+
+data_processing/data_pipeline.ipynb
+data_processing/eda.ipynb
+data_processing/split_parquets_by_time.ipynb
