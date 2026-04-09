@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from statistics import mean
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -39,6 +39,7 @@ from Cache_System_Workflow.sabre_cache_workflow_v2 import PreparedWorkflowInput,
 from demand_forecasting.model_input import DemandScoreGenerator
 from LRU.simulate_lru_baseline import VanillaLRUCache
 from data_processing.pipeline import DataPipelineProcessor
+from midas.midas_score import build_midas_scores
 
 lambda_model = importlib.import_module("lambda_model")
 build_lambda_table = lambda_model.build_lambda_table
@@ -148,6 +149,16 @@ def _bucketize_lead_time(series: pd.Series) -> pd.Series:
     return series.fillna(0).astype(int).apply(_assign_lead_time_bucket)
 
 
+def _resolve_hotel_code(row: Any) -> str:
+    hotel = getattr(row, "hotel_code", None)
+    if hotel is not None and str(hotel).strip() not in ("", "nan", "None"):
+        return str(hotel)
+    chain = getattr(row, "chain_code", None)
+    if chain is not None and str(chain).strip() not in ("", "nan", "None"):
+        return str(chain)
+    return "unknown"
+
+
 def _ttl_from_lambda(lambda_val: float) -> int:
     safe_lambda = max(float(lambda_val), 1e-6)
     ttl = -math.log(TTL_TARGET_FRESHNESS) / safe_lambda
@@ -208,7 +219,14 @@ def _build_lambda_based_ttl_lookup(source_df: pd.DataFrame, method: str) -> Dict
         return {}
 
     frame = table.copy()
-    frame["lead_time_bucket"] = _bucketize_lead_time(frame["lead_time"])
+    if "horizon_bucket" in frame.columns:
+        frame["lead_time_bucket"] = frame["horizon_bucket"].astype(str)
+    elif "lead_time_bucket" in frame.columns:
+        frame["lead_time_bucket"] = frame["lead_time_bucket"].astype(str)
+    elif "lead_time" in frame.columns:
+        frame["lead_time_bucket"] = _bucketize_lead_time(frame["lead_time"])
+    else:
+        frame["lead_time_bucket"] = "same_day"
 
     weighted_lambda = (
         frame.groupby("lead_time_bucket", dropna=False)
@@ -250,16 +268,24 @@ def _build_ttl_lookup(source_df: pd.DataFrame, ttl_method: str) -> Dict[str, int
     raise ValueError(f"Unsupported ttl_method='{ttl_method}'. Use one of: glm, pp, rule_based, km")
 
 
-def _prepare_requests(requests_df: pd.DataFrame, p_reuse_df: pd.DataFrame) -> List[PreparedWorkflowInput]:
+def _prepare_requests(
+    requests_df: pd.DataFrame,
+    score_df: pd.DataFrame,
+    score_column: str = "p_reuse",
+    lambda_i_default: float = 1.0,
+) -> List[PreparedWorkflowInput]:
+    if score_column not in score_df.columns:
+        raise ValueError(f"score_df must include '{score_column}'")
     p_lookup = (
-        p_reuse_df.dropna(subset=["cache_key", "p_reuse"])
-        .groupby("cache_key", as_index=False)["p_reuse"]
+        score_df.dropna(subset=["cache_key", score_column])
+        .groupby("cache_key", as_index=False)[score_column]
         .mean()
     )
+    p_lookup = p_lookup.rename(columns={score_column: "admission_score"})
     merged = requests_df.merge(p_lookup, on=["cache_key"], how="left")
     merged["rq_timestamp"] = pd.to_datetime(merged["rq_timestamp"], errors="coerce", utc=True)
     merged = merged.dropna(subset=["rq_timestamp"]).sort_values("rq_timestamp", kind="stable").reset_index(drop=True)
-    merged["p_reuse"] = merged["p_reuse"].fillna(0.5)
+    merged["admission_score"] = pd.to_numeric(merged["admission_score"], errors="coerce").fillna(0.5).clip(0.0, 1.0)
 
     prepared: List[PreparedWorkflowInput] = []
     for row in merged.itertuples(index=False):
@@ -267,7 +293,7 @@ def _prepare_requests(requests_df: pd.DataFrame, p_reuse_df: pd.DataFrame) -> Li
             PreparedWorkflowInput(
                 request=RequestContext(
                     rq_timestamp=row.rq_timestamp.to_pydatetime() if hasattr(row.rq_timestamp, "to_pydatetime") else row.rq_timestamp,
-                    chain_code=str(row.chain_code),
+                    hotel_code=_resolve_hotel_code(row),
                     stay_start_date=str(pd.Timestamp(row.rq_stay_start_date).strftime("%Y-%m-%d")),
                     stay_end_date=str(pd.Timestamp(row.rq_stay_end_date).strftime("%Y-%m-%d")),
                     duration=int(row.duration),
@@ -275,8 +301,8 @@ def _prepare_requests(requests_df: pd.DataFrame, p_reuse_df: pd.DataFrame) -> Li
                     lead_time_days=int(row.lead_time),
                     cache_key_value=str(row.cache_key),
                 ),
-                p_reuse=float(row.p_reuse),
-                lambda_i=1.0,  # admission score uses p_reuse only
+                p_reuse=float(row.admission_score),
+                lambda_i=float(lambda_i_default),
             )
         )
     return prepared
@@ -412,7 +438,7 @@ def _run_lru_baseline(requests_df: pd.DataFrame) -> LRUSummary:
     for idx, row in enumerate(requests_df.itertuples(index=False), start=1):
         request = RequestContext(
             rq_timestamp=row.rq_timestamp.to_pydatetime() if hasattr(row.rq_timestamp, "to_pydatetime") else row.rq_timestamp,
-            chain_code=str(row.chain_code),
+            hotel_code=_resolve_hotel_code(row),
             stay_start_date=str(pd.Timestamp(row.rq_stay_start_date).strftime("%Y-%m-%d")),
             stay_end_date=str(pd.Timestamp(row.rq_stay_end_date).strftime("%Y-%m-%d")),
             duration=int(row.duration),
@@ -473,6 +499,9 @@ def run_ttl_method_eval(
     score_percentile: float = 0.7,
     prefetch_ratio: float = 0.2,
     enable_background_refresh: bool = False,
+    admission_score_source: str = "p_reuse",
+    midas_w_demand: float = 0.8,
+    midas_w_markov: float = 0.2,
 ) -> None:
     processor = DataPipelineProcessor(data_root=str(ROOT_DIR / "data" / "cleaned_partitioned"))
     source_df, prepared_df = processor.process(partition_date=partition_date, max_rows=max_requests)
@@ -488,8 +517,26 @@ def run_ttl_method_eval(
         output_parquet=None,
     )
 
+    score_source = str(admission_score_source).strip().lower()
+    if score_source not in {"p_reuse", "midas"}:
+        raise ValueError("admission_score_source must be one of: p_reuse, midas")
+
+    score_df: pd.DataFrame
+    score_column: str
+    if score_source == "midas":
+        score_df = build_midas_scores(
+            requests_df=source_df,
+            p_reuse_df=p_reuse_df,
+            w_demand=float(midas_w_demand),
+            w_markov=float(midas_w_markov),
+        )
+        score_column = "midas_score"
+    else:
+        score_df = p_reuse_df
+        score_column = "p_reuse"
+
     truth_price_by_key = _build_truth_price_lookup(source_df)
-    prepared_requests = _prepare_requests(source_df, p_reuse_df)
+    prepared_requests = _prepare_requests(source_df, score_df=score_df, score_column=score_column, lambda_i_default=1.0)
     lru_summary = _run_lru_baseline(source_df)
 
     ttl_methods = ["glm", "pp", "rule_based", "km"]
@@ -516,12 +563,16 @@ def run_ttl_method_eval(
         )
 
     lines: List[str] = []
-    lines.append("TTL METHOD EVAL (admission score uses p_reuse only)")
+    lines.append(f"TTL METHOD EVAL (admission score source={score_source})")
     lines.append(f"partition_date={partition_date}")
     lines.append(f"sample_requests={len(source_df)}")
     lines.append(f"unique_request_keys={source_df['cache_key'].nunique()}")
     lines.append(f"prepared_feature_rows={len(prepared_df)}")
     lines.append(f"p_reuse_rows={len(p_reuse_df)}")
+    if score_source == "midas":
+        lines.append(f"midas_rows={len(score_df)}")
+        lines.append(f"midas_weights=demand:{float(midas_w_demand):.3f},markov:{float(midas_w_markov):.3f}")
+    lines.append(f"admission_score_column={score_column}")
     lines.append("")
 
     lines.append("=== LRU Baseline ===")
@@ -564,6 +615,14 @@ if __name__ == "__main__":
     parser.add_argument("--score-percentile", type=float, default=0.7, help="Score percentile (default: 0.7)")
     parser.add_argument("--prefetch-ratio", type=float, default=0.2, help="Prefetch ratio (default: 0.2)")
     parser.add_argument("--enable-background-refresh", action="store_true", help="Enable background refresh")
+    parser.add_argument(
+        "--admission-score-source",
+        choices=["p_reuse", "midas"],
+        default="p_reuse",
+        help="Admission score source (default: p_reuse)",
+    )
+    parser.add_argument("--midas-w-demand", type=float, default=0.8, help="MIDAS demand weight (default: 0.8)")
+    parser.add_argument("--midas-w-markov", type=float, default=0.2, help="MIDAS Markov weight (default: 0.2)")
     
     args = parser.parse_args()
     
@@ -576,4 +635,7 @@ if __name__ == "__main__":
         score_percentile=args.score_percentile,
         prefetch_ratio=args.prefetch_ratio,
         enable_background_refresh=args.enable_background_refresh,
+        admission_score_source=args.admission_score_source,
+        midas_w_demand=args.midas_w_demand,
+        midas_w_markov=args.midas_w_markov,
     )

@@ -4,6 +4,7 @@ This repository runs end-to-end cache policy experiments for hotel pricing reque
 
 Main objectives:
 - generate demand reuse score (`p_reuse`)
+- optionally build MIDAS admission score (`midas_score`)
 - estimate TTL by multiple methods (`glm`, `pp`, `rule_based`, `km`)
 - evaluate two-tier cache workflow vs LRU baseline
 - report hit rate, provider calls, staleness, prewarm quality, and eviction behavior
@@ -13,7 +14,7 @@ Main objectives:
 Use [Cache_System_Workflow/cache_pipeline.py](Cache_System_Workflow/cache_pipeline.py) as the main experiment script.
 
 Current setup in this script:
-- admission score uses `p_reuse` only (`lambda_i=1.0` in prepared input)
+- admission score source is configurable: `p_reuse` or `midas`
 - TTL method is varied across `glm`, `pp`, `rule_based`, `km`
 - workflow engine is [Cache_System_Workflow/sabre_cache_workflow_v2.py](Cache_System_Workflow/sabre_cache_workflow_v2.py)
 

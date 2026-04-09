@@ -116,7 +116,7 @@ def _load_requests_from_partition(
         request_df = request_df.drop_duplicates(subset=["rq_correlation_id"])
 
     request_df = request_df.dropna(
-        subset=["rq_timestamp", "rq_stay_start_date", "rq_stay_end_date", "chain_code", "location_city_code", "cache_key"]
+        subset=["rq_timestamp", "rq_stay_start_date", "rq_stay_end_date", "location_city_code", "cache_key"]
     )
     request_df = request_df.sort_values("rq_timestamp", kind="stable").reset_index(drop=True)
 
@@ -125,10 +125,13 @@ def _load_requests_from_partition(
         stay_start_date = pd.Timestamp(row.rq_stay_start_date).strftime("%Y-%m-%d")
         stay_end_date = pd.Timestamp(row.rq_stay_end_date).strftime("%Y-%m-%d")
         duration = max(0, (pd.Timestamp(row.rq_stay_end_date) - pd.Timestamp(row.rq_stay_start_date)).days)
+        hotel_code = getattr(row, "hotel_code", None)
+        if hotel_code is None or str(hotel_code).strip() in ("", "nan", "None"):
+            hotel_code = getattr(row, "chain_code", "unknown")
         requests.append(
             RequestContext(
                 rq_timestamp=row.rq_timestamp.to_pydatetime(),
-                chain_code=str(row.chain_code),
+                hotel_code=str(hotel_code),
                 stay_start_date=stay_start_date,
                 stay_end_date=stay_end_date,
                 duration=duration,

@@ -48,16 +48,18 @@ def _to_lines(df: pd.DataFrame, max_rows: int = 20) -> Iterable[str]:
         yield "No groups passed min_intervals filter."
         return
     cols = [
-        "chain_code",
-        "lead_time",
+        "hotel_grouped",
+        "horizon_bucket",
         "rate_source",
         "n_intervals",
         "n_events",
         "exposure_hours",
         "lambda_method",
         "lambda_final",
+        "fallback_level",
     ]
-    show = df[cols].head(max_rows)
+    show_cols = [c for c in cols if c in df.columns]
+    show = df[show_cols].head(max_rows)
     yield show.to_string(index=False)
 
 
@@ -122,16 +124,31 @@ def run_smoke_km_lambda(
         elif partition_date:
             processed_df = processed_df[ts.dt.strftime("%Y-%m-%d") == partition_date].copy()
 
-    required = ["chain_code", "lead_time", "rate_source", "rq_timestamp", "price_change"]
+    required = ["rate_source", "rq_timestamp", "price_change"]
     missing = [c for c in required if c not in processed_df.columns]
     if missing:
         raise ValueError(f"Input df is missing required columns: {missing}")
 
+    if "hotel_code" not in processed_df.columns and "chain_code" not in processed_df.columns:
+        raise ValueError("Input df must include either 'hotel_code' or 'chain_code'.")
+
     processed_df["rq_timestamp"] = pd.to_datetime(processed_df["rq_timestamp"], errors="coerce", utc=True)
-    processed_df = processed_df.dropna(subset=["rq_timestamp", "chain_code", "lead_time", "rate_source"]).copy()
+    processed_df = processed_df.dropna(subset=["rq_timestamp", "rate_source"]).copy()
+
+    if "lead_time" not in processed_df.columns:
+        processed_df["lead_time"] = 0
+    processed_df["lead_time"] = pd.to_numeric(processed_df["lead_time"], errors="coerce").fillna(0).clip(lower=0).astype(int)
+    if "hotel_grouped" not in processed_df.columns:
+        id_col = "hotel_code" if "hotel_code" in processed_df.columns else "chain_code"
+        vc = processed_df[id_col].astype(str).value_counts(dropna=False)
+        keep = set(vc.head(300).index.astype(str).tolist())
+        processed_df["hotel_grouped"] = processed_df[id_col].astype(str).where(processed_df[id_col].astype(str).isin(keep), other="Other")
+    processed_df["horizon_bucket"] = processed_df["lead_time"].apply(
+        lambda x: "same_day" if x <= 1 else ("short" if x <= 3 else ("mid" if x <= 7 else ("long" if x <= 30 else "very_long")))
+    )
 
     grouped_stats = (
-        processed_df.groupby(["chain_code", "lead_time", "rate_source"], dropna=False)
+        processed_df.groupby(["hotel_grouped", "horizon_bucket", "rate_source"], dropna=False)
         .agg(obs_count=("price_change", "size"), price_change_count=("price_change", "sum"))
         .reset_index()
     )

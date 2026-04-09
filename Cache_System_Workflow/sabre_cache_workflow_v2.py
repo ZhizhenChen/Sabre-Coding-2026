@@ -50,7 +50,7 @@ class LeadTimeTTLBucket:
 @dataclass(frozen=True)
 class RequestContext:
     rq_timestamp: datetime
-    chain_code: str
+    hotel_code: str
     stay_start_date: str
     stay_end_date: str
     duration: int
@@ -61,12 +61,12 @@ class RequestContext:
     def cache_key(self) -> str:
         """
         Cache key format:
-        <chain_code::city_code::stay_start_date::stay_end_date>
+        <hotel_code::city_code::stay_start_date::stay_end_date>
         """
         if self.cache_key_value:
             return self.cache_key_value
         return (
-            f"{self.chain_code}::"
+            f"{self.hotel_code}::"
             f"{self.city_code}::"
             f"{self.stay_start_date}::"
             f"{self.stay_end_date}"
@@ -653,7 +653,7 @@ if __name__ == "__main__":
 
     req = RequestContext(
         rq_timestamp=_utc_now(),
-        chain_code="HY",
+        hotel_code="HY",
         stay_start_date="2026-05-01",
         stay_end_date="2026-05-03",
         duration=2,

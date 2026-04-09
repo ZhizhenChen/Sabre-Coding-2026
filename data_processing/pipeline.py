@@ -24,6 +24,7 @@ class DataPipelineProcessor:
             data_root: Path to cleaned_partitioned directory
         """
         self.data_root = Path(data_root)
+        self.top_n_hotels = 300
 
     def process(self, partition_date: str, max_rows: Optional[int] = None) -> Tuple[pd.DataFrame, pd.DataFrame]:
         """
@@ -130,9 +131,22 @@ class DataPipelineProcessor:
         df['lead_time'] = (df['rq_stay_start_date_utc'] - df['rq_timestamp']).dt.days
         df.loc[df['lead_time'] < 0, 'lead_time'] = 0
 
+        # Normalize entity id: prefer hotel_code; fallback to chain_code if absent.
+        if 'hotel_code' in df.columns:
+            entity_id = df['hotel_code'].astype(str)
+        elif 'chain_code' in df.columns:
+            entity_id = df['chain_code'].astype(str)
+        else:
+            entity_id = pd.Series(['unknown'] * len(df), index=df.index, dtype='object')
+        df['hotel_code'] = entity_id
+
+        # Group hotels to reduce sparsity in downstream TTL lambda grouping.
+        top_hotels = df['hotel_code'].value_counts(dropna=False).head(self.top_n_hotels).index.tolist()
+        df['hotel_grouped'] = df['hotel_code'].where(df['hotel_code'].isin(top_hotels), other='Other')
+
         # Cache key
         df['cache_key'] = (
-            df['chain_code'].astype(str) + '-' +
+            df['hotel_code'].astype(str) + '-' +
             df['location_city_code'] + '-' +
             df['rq_stay_start_date'].dt.strftime('%Y-%m-%d') + '-' +
             df['rq_stay_end_date'].dt.strftime('%Y-%m-%d')
@@ -205,9 +219,12 @@ class DataPipelineProcessor:
         #     df['location_latitude'].astype(str) + '_' +
         #     df['location_longitude'].astype(str)
         # )
-        df = df.sort_values(['hotel_code', 'lead_time'])
+        group_entity = 'hotel_code' if 'hotel_code' in df.columns else ('chain_code' if 'chain_code' in df.columns else None)
+        if group_entity is None:
+            raise ValueError("Input data must include either 'hotel_code' or 'chain_code'.")
+        df = df.sort_values([group_entity, 'lead_time'])
         df['price_change'] = (
-            df.groupby(['hotel_code', 'lead_time', 'rate_source'])['price_per_day']
+            df.groupby([group_entity, 'lead_time', 'rate_source'])['price_per_day']
             .transform(lambda x: (np.abs(x - x.shift()) > 1))
             .fillna(False)
             .astype(int)

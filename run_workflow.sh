@@ -14,6 +14,9 @@ UNCONTROLLED_CAPACITY=900
 SCORE_PERCENTILE=0.7
 PREFETCH_RATIO=0.2
 ENABLE_BACKGROUND_REFRESH=false
+ADMISSION_SCORE_SOURCE="p_reuse"
+MIDAS_W_DEMAND=0.8
+MIDAS_W_MARKOV=0.2
 
 # Parse command line arguments
 while [[ $# -gt 0 ]]; do
@@ -50,6 +53,18 @@ while [[ $# -gt 0 ]]; do
             ENABLE_BACKGROUND_REFRESH=true
             shift
             ;;
+        --admission-score-source)
+            ADMISSION_SCORE_SOURCE="$2"
+            shift 2
+            ;;
+        --midas-w-demand)
+            MIDAS_W_DEMAND="$2"
+            shift 2
+            ;;
+        --midas-w-markov)
+            MIDAS_W_MARKOV="$2"
+            shift 2
+            ;;
         --help)
             echo "Usage: ./run_workflow.sh [options]"
             echo ""
@@ -62,6 +77,9 @@ while [[ $# -gt 0 ]]; do
             echo "  --score-percentile FLOAT           Score percentile (default: 0.7)"
             echo "  --prefetch-ratio FLOAT             Prefetch ratio (default: 0.2)"
             echo "  --enable-background-refresh        Enable background refresh flag"
+            echo "  --admission-score-source SOURCE    Admission score source: p_reuse|midas"
+            echo "  --midas-w-demand FLOAT             MIDAS demand weight (default: 0.8)"
+            echo "  --midas-w-markov FLOAT             MIDAS markov weight (default: 0.2)"
             echo "  --help                             Show this help message"
             echo ""
             echo "Examples:"
@@ -95,6 +113,9 @@ PYTHON_CMD="$PYTHON_CMD --controlled-capacity $CONTROLLED_CAPACITY"
 PYTHON_CMD="$PYTHON_CMD --uncontrolled-capacity $UNCONTROLLED_CAPACITY"
 PYTHON_CMD="$PYTHON_CMD --score-percentile $SCORE_PERCENTILE"
 PYTHON_CMD="$PYTHON_CMD --prefetch-ratio $PREFETCH_RATIO"
+PYTHON_CMD="$PYTHON_CMD --admission-score-source $ADMISSION_SCORE_SOURCE"
+PYTHON_CMD="$PYTHON_CMD --midas-w-demand $MIDAS_W_DEMAND"
+PYTHON_CMD="$PYTHON_CMD --midas-w-markov $MIDAS_W_MARKOV"
 
 if [ "$ENABLE_BACKGROUND_REFRESH" = true ]; then
     PYTHON_CMD="$PYTHON_CMD --enable-background-refresh"
@@ -112,6 +133,9 @@ echo "Uncontrolled Capacity:    $UNCONTROLLED_CAPACITY"
 echo "Score Percentile:         $SCORE_PERCENTILE"
 echo "Prefetch Ratio:           $PREFETCH_RATIO"
 echo "Background Refresh:       $ENABLE_BACKGROUND_REFRESH"
+echo "Admission Score Source:   $ADMISSION_SCORE_SOURCE"
+echo "MIDAS W Demand:           $MIDAS_W_DEMAND"
+echo "MIDAS W Markov:           $MIDAS_W_MARKOV"
 echo "=========================================="
 echo ""
 

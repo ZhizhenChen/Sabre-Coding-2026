@@ -134,7 +134,7 @@ class DemandScoreGenerator:
             return 0.05
 
     def _fallback_demand_score_predictor(self, feature_frame: pd.DataFrame, processed_df: pd.DataFrame) -> pd.Series:
-        """Fallback predictor using demand_score method: chain × duration × lead_time × rating.
+        """Fallback predictor using demand_score method: hotel × duration × lead_time × rating.
         
         Based on demand_forecasting.ipynb weighted scoring approach.
         """
@@ -150,12 +150,13 @@ class DemandScoreGenerator:
         #     return pd.Series(pred, index=feature_frame.index)
         
         # Use source_df to compute demand score weights
-        source = self._source_df_for_fallback[['cache_key', 'chain_code', 'duration', 'lead_time', 'sabre_rating']].copy()
+        id_col = 'hotel_code' if 'hotel_code' in self._source_df_for_fallback.columns else 'chain_code'
+        source = self._source_df_for_fallback[['cache_key', id_col, 'duration', 'lead_time', 'sabre_rating']].copy()
         
-        # 1. Chain weight: log1p normalization of chain frequencies
-        chain_counts = source['chain_code'].value_counts()
-        chain_weight_map = np.log1p(chain_counts) / np.log1p(chain_counts).max()
-        source['chain_weight'] = source['chain_code'].map(chain_weight_map).fillna(0.0)
+        # 1. Hotel weight: log1p normalization of hotel frequencies
+        hotel_counts = source[id_col].value_counts()
+        hotel_weight_map = np.log1p(hotel_counts) / np.log1p(hotel_counts).max()
+        source['hotel_weight'] = source[id_col].map(hotel_weight_map).fillna(0.0)
         
         # 2. Duration weight: log1p normalization of duration frequencies
         duration_counts = source['duration'].value_counts()
@@ -172,7 +173,7 @@ class DemandScoreGenerator:
         
         # 5. Compute demand score as product of all weights
         source['demand_score'] = (
-            source['chain_weight'] * 
+            source['hotel_weight'] * 
             source['duration_weight'] * 
             source['lead_time_weight'] * 
             source['rating_weight']
