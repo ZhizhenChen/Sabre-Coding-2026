@@ -16,7 +16,7 @@ import numpy as np
 import pandas as pd
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
-LAMBDA_DIR = ROOT_DIR / "lambda"
+LAMBDA_DIR = ROOT_DIR / "Lambda"
 LRU_DIR = ROOT_DIR / "LRU"
 
 if str(ROOT_DIR) not in sys.path:
@@ -276,7 +276,7 @@ def _run_ttl_method(
     requests_df: pd.DataFrame,
     prepared_requests: List[PreparedWorkflowInput],
     ttl_lookup_by_bucket: Dict[str, int],
-    truth_price_by_key: Dict[str, float],
+    truth_price_by_key: Dict[str, List[Dict[str, Any]]],
     lru_provider_calls: int,
     controlled_capacity: int = 100,
     uncontrolled_capacity: int = 900,
