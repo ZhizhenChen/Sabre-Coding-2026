@@ -132,7 +132,7 @@ class DataPipelineProcessor:
 
         # Cache key
         df['cache_key'] = (
-            df['chain_code'].astype(str) + '-' +
+            df['hotel_code'].astype(str) + '-' +
             df['location_city_code'] + '-' +
             df['rq_stay_start_date'].dt.strftime('%Y-%m-%d') + '-' +
             df['rq_stay_end_date'].dt.strftime('%Y-%m-%d')
