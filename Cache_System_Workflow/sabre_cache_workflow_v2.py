@@ -72,6 +72,20 @@ class RequestContext:
             f"{self.stay_end_date}"
         )
 
+@dataclass
+class TruthPriceProvider:
+    def __init__(self, truth_price_by_key: Dict[str, List[Dict[str, Any]]]) -> None:
+        self.calls = 0
+        self.truth_price_by_key = truth_price_by_key
+
+    def __call__(self, request: RequestContext) -> Dict[str, Any]:
+        self.calls += 1
+        key = request.cache_key()
+        offers = self.truth_price_by_key.get(key, [])
+        return {
+            "request_key": key,
+            "offers": offers,
+        }
 
 @dataclass
 class CacheEntry:

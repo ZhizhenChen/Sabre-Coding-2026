@@ -26,7 +26,7 @@ if str(LAMBDA_DIR) not in sys.path:
 if str(LRU_DIR) not in sys.path:
     sys.path.insert(0, str(LRU_DIR))
 
-from Cache_System_Workflow.sabre_cache_workflow_v2 import PreparedWorkflowInput, RequestContext, SabreCacheWorkflow
+from Cache_System_Workflow.sabre_cache_workflow_v2 import TruthPriceProvider, PreparedWorkflowInput, RequestContext, SabreCacheWorkflow
 from demand_forecasting.model_input import DemandScoreGenerator
 from LRU.simulate_lru_baseline import VanillaLRUCache
 from data_processing.pipeline import DataPipelineProcessor
@@ -77,20 +77,6 @@ class LRUSummary:
     wrong_eviction_count: int
     avg_query_after_eviction: float
 
-
-class TruthPriceProvider:
-    def __init__(self, truth_price_by_key: Dict[str, List[Dict[str, Any]]]) -> None:
-        self.calls = 0
-        self.truth_price_by_key = truth_price_by_key
-
-    def __call__(self, request: RequestContext) -> Dict[str, Any]:
-        self.calls += 1
-        key = request.cache_key()
-        offers = self.truth_price_by_key.get(key, [])
-        return {
-            "request_key": key,
-            "offers": offers,
-        }
 
 
 def _build_truth_price_lookup(source_df: pd.DataFrame) -> Dict[str, List[Dict[str, Any]]]:
