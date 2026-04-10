@@ -118,11 +118,6 @@ class PreparedWorkflowInput:
     lambda_i: float
 
 
-class DataProvider(Protocol):
-    def __call__(self, request: RequestContext) -> Any:
-        ...
-
-
 class SabreCacheWorkflow:
     """
     Two-tier cache workflow for Sabre hotel requests.
@@ -173,7 +168,7 @@ class SabreCacheWorkflow:
         uncontrolled_ttl_lookup_by_lead_time: Optional[List[Tuple[int, int, int]]] = None,
         staleness_threshold: float = 0.01,
         max_cache_size_mb: float = 60.0,
-        avg_entry_size_bytes: int = 500,
+        avg_entry_size_bytes: int = 1000,
         min_cache_util_fraction: float = 0.20,
         prefetch_ratio: float = 0.01,
         refresh_interval_seconds: int = 60,
@@ -207,7 +202,7 @@ class SabreCacheWorkflow:
         self.refresh_interval_seconds = refresh_interval_seconds
         self.enable_background_refresh = enable_background_refresh
         self._now_fn = now_fn
-        self._refresh_provider: Optional[DataProvider] = None
+        self._refresh_provider: Optional[TruthPriceProvider] = None
         self._lock = threading.RLock()
         self._stop_event = threading.Event()
         self._controlled: OrderedDict[str, CacheEntry] = OrderedDict()
@@ -470,7 +465,7 @@ class SabreCacheWorkflow:
         request: RequestContext,
         p_reuse: float,
         lambda_i: float,
-        provider: DataProvider,
+        provider: TruthPriceProvider,
     ) -> WorkflowResult:
         self._refresh_provider = provider
         request_now = request.rq_timestamp
@@ -555,7 +550,7 @@ class SabreCacheWorkflow:
     def run_prepared_requests(
         self,
         prepared_requests: List[PreparedWorkflowInput],
-        provider: DataProvider,
+        provider: TruthPriceProvider,
     ) -> List[WorkflowResult]:
         """Run cache workflow on upstream-prepared request records.
 
@@ -577,7 +572,7 @@ class SabreCacheWorkflow:
     def prefetch_controlled(
         self,
         candidates: List[Tuple[RequestContext, float, float]],
-        provider: DataProvider,
+        provider: TruthPriceProvider,
     ) -> List[str]:
         """
         Prefetch top-k p_reuse requests into controlled cache when keys are not cached.

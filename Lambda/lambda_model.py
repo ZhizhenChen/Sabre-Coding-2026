@@ -29,12 +29,10 @@ def _safe_int(value: object, default: int = 0) -> int:
 
 
 def _resolve_group_key(df_enriched: pd.DataFrame) -> str:
-	"""Prefer chain-level grouping to reduce sparsity vs market-level keys."""
-	if "chain_code" in df_enriched.columns:
-		return "chain_code"
-	if "market_key" in df_enriched.columns:
-		return "market_key"
-	raise ValueError("df_enriched must include either 'chain_code' or 'market_key'.")
+	"""Use hotel-level grouping for lambda estimation."""
+	if "hotel_code" in df_enriched.columns:
+		return "hotel_code"
+	raise ValueError("df_enriched must include 'hotel_code'.")
 
 
 def _group_level_stats(df_enriched: pd.DataFrame) -> pd.DataFrame:
@@ -47,7 +45,7 @@ def _group_level_stats(df_enriched: pd.DataFrame) -> pd.DataFrame:
 		summary = estimate_lambda_km(g)
 		rows.append(
 			{
-				"chain_code": str(keys[0]),
+				"hotel_code": str(keys[0]),
 				"lead_time": _safe_int(keys[1]),
 				"rate_source": str(keys[2]),
 				"n_intervals": summary.n_intervals,
@@ -277,7 +275,7 @@ def build_lambda_table(
 	"""Unified lambda table builder for comparing multiple estimation methods.
 
 	Args:
-		df_enriched: Enriched dataframe with rq_timestamp and price_change.
+		df_enriched: Enriched dataframe with rq_timestamp, hotel_code, and price_change.
 		min_intervals: Minimum intervals required per group.
 		method: One of ["km", "poisson", "glm", "fallback"].
 	"""

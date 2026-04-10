@@ -205,6 +205,8 @@ class DataPipelineProcessor:
         #     df['location_latitude'].astype(str) + '_' +
         #     df['location_longitude'].astype(str)
         # )
+
+        # add start date
         df = df.sort_values(['hotel_code', 'lead_time'])
         df['price_change'] = (
             df.groupby(['hotel_code', 'lead_time', 'rate_source'])['price_per_day']

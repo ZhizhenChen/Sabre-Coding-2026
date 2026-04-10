@@ -131,6 +131,24 @@ def _ttl_from_lambda(lambda_val: float) -> int:
     return int(max(MIN_TTL_SECONDS, min(MAX_TTL_SECONDS, ttl * 3600.0)))
 
 
+def _lambda_from_ttl_seconds(ttl_seconds: int) -> float:
+    safe_ttl = max(float(ttl_seconds), 1.0)
+    safe_target = min(max(float(TTL_TARGET_FRESHNESS), 1e-6), 1.0 - 1e-6)
+    return float(-math.log(safe_target) / safe_ttl)
+
+
+def _admission_lambda_for_request(
+    request: RequestContext,
+    ttl_lookup_by_bucket: Dict[str, int],
+) -> float:
+    lead_time_days = int(request.lead_time_days) if request.lead_time_days is not None else max(0, request.duration)
+    bucket = _assign_lead_time_bucket(lead_time_days)
+    ttl_seconds = ttl_lookup_by_bucket.get(bucket)
+    if ttl_seconds is None:
+        return 1.0
+    return _lambda_from_ttl_seconds(ttl_seconds)
+
+
 def _build_rule_based_ttl_lookup() -> Dict[str, int]:
     # A simple deterministic baseline policy.
     return {
@@ -282,7 +300,14 @@ def _run_ttl_method(
         km_ttl_lookup_by_bucket=ttl_lookup_by_bucket,
     )
 
-    candidate_tuples = [(item.request, item.p_reuse, item.lambda_i) for item in prepared_requests]
+    candidate_tuples = [
+        (
+            item.request,
+            item.p_reuse,
+            _admission_lambda_for_request(item.request, ttl_lookup_by_bucket),
+        )
+        for item in prepared_requests
+    ]
     prefetched_keys = workflow.prefetch_controlled(candidate_tuples, provider)
 
     hit_count = 0
@@ -297,7 +322,8 @@ def _run_ttl_method(
         key = request.cache_key()
         requests_by_key[key].append(idx)
         before_keys = _workflow_cache_keys(workflow)
-        result = workflow.get(request, p_reuse=item.p_reuse, lambda_i=item.lambda_i, provider=provider)
+        admission_lambda = _admission_lambda_for_request(request, ttl_lookup_by_bucket)
+        result = workflow.get(request, p_reuse=item.p_reuse, lambda_i=admission_lambda, provider=provider)
         after_keys = _workflow_cache_keys(workflow)
 
         evicted_keys = before_keys - after_keys
@@ -363,10 +389,10 @@ def _run_ttl_method(
     )
 
 
-def _run_lru_baseline(requests_df: pd.DataFrame) -> LRUSummary:
+def _run_lru_baseline(requests_df: pd.DataFrame, lru_capacity: int = 1000) -> LRUSummary:
     truth_price_by_key = _build_truth_price_lookup(requests_df)
     provider = TruthPriceProvider(truth_price_by_key)
-    lru = VanillaLRUCache(capacity=1000)
+    lru = VanillaLRUCache(capacity=lru_capacity)
 
     hit_count = 0
     miss_count = 0
@@ -434,6 +460,7 @@ def run_ttl_method_eval(
     output_path: str = "workflow_ttl_methods_eval_2026-02-07_3000.txt",
     controlled_capacity: int = 100,
     uncontrolled_capacity: int = 900,
+    lru_capacity: int = 1000,
     score_percentile: float = 0.7,
     prefetch_ratio: float = 0.2,
     enable_background_refresh: bool = False,
@@ -454,7 +481,7 @@ def run_ttl_method_eval(
 
     truth_price_by_key = _build_truth_price_lookup(source_df)
     prepared_requests = _prepare_requests(source_df, p_reuse_df)
-    lru_summary = _run_lru_baseline(source_df)
+    lru_summary = _run_lru_baseline(source_df, lru_capacity=lru_capacity)
 
     ttl_methods = ["glm", "pp", "rule_based", "km"]
     evals: List[EvalSummary] = []
@@ -480,7 +507,7 @@ def run_ttl_method_eval(
         )
 
     lines: List[str] = []
-    lines.append("TTL METHOD EVAL (admission score uses p_reuse only)")
+    lines.append("TTL METHOD EVAL (admission score uses TTL-implied lambda)")
     lines.append(f"partition_date={partition_date}")
     lines.append(f"sample_requests={len(source_df)}")
     lines.append(f"unique_request_keys={source_df['cache_key'].nunique()}")
@@ -525,6 +552,7 @@ if __name__ == "__main__":
     parser.add_argument("--output-path", default="workflow_ttl_methods_eval_2026-02-07_all.txt", help="Output file path")
     parser.add_argument("--controlled-capacity", type=int, default=100, help="Controlled cache capacity (default: 100)")
     parser.add_argument("--uncontrolled-capacity", type=int, default=900, help="Uncontrolled cache capacity (default: 900)")
+    parser.add_argument("--lru-capacity", type=int, default=1000, help="LRU baseline capacity (default: 1000)")
     parser.add_argument("--score-percentile", type=float, default=0.7, help="Score percentile (default: 0.7)")
     parser.add_argument("--prefetch-ratio", type=float, default=0.2, help="Prefetch ratio (default: 0.2)")
     parser.add_argument("--enable-background-refresh", action="store_true", help="Enable background refresh")
@@ -537,6 +565,7 @@ if __name__ == "__main__":
         output_path=args.output_path,
         controlled_capacity=args.controlled_capacity,
         uncontrolled_capacity=args.uncontrolled_capacity,
+        lru_capacity=args.lru_capacity,
         score_percentile=args.score_percentile,
         prefetch_ratio=args.prefetch_ratio,
         enable_background_refresh=args.enable_background_refresh,

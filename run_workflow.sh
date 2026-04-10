@@ -7,10 +7,11 @@ set -e
 
 # Default values
 PARTITION_DATE="2026-02-07"
-MAX_REQUESTS=3000
+MAX_REQUESTS=500
 OUTPUT_PATH="workflow_ttl_methods_eval_$(date +%Y-%m-%d_%H%M%S).txt"
-CONTROLLED_CAPACITY=100
-UNCONTROLLED_CAPACITY=900
+CONTROLLED_CAPACITY=50000
+UNCONTROLLED_CAPACITY=450000
+LRU_CAPACITY=500000
 SCORE_PERCENTILE=0.7
 PREFETCH_RATIO=0.2
 ENABLE_BACKGROUND_REFRESH=false
@@ -38,6 +39,10 @@ while [[ $# -gt 0 ]]; do
             UNCONTROLLED_CAPACITY="$2"
             shift 2
             ;;
+        --lru-capacity)
+            LRU_CAPACITY="$2"
+            shift 2
+            ;;
         --score-percentile)
             SCORE_PERCENTILE="$2"
             shift 2
@@ -59,6 +64,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --output-path PATH                 Output file path (default: workflow_ttl_methods_eval_TIMESTAMP.txt)"
             echo "  --controlled-capacity NUM          Controlled cache capacity (default: 100)"
             echo "  --uncontrolled-capacity NUM        Uncontrolled cache capacity (default: 900)"
+            echo "  --lru-capacity NUM                 LRU baseline capacity (default: 1000)"
             echo "  --score-percentile FLOAT           Score percentile (default: 0.7)"
             echo "  --prefetch-ratio FLOAT             Prefetch ratio (default: 0.2)"
             echo "  --enable-background-refresh        Enable background refresh flag"
@@ -93,6 +99,7 @@ PYTHON_CMD="$PYTHON_CMD --max-requests $MAX_REQUESTS"
 PYTHON_CMD="$PYTHON_CMD --output-path $OUTPUT_PATH"
 PYTHON_CMD="$PYTHON_CMD --controlled-capacity $CONTROLLED_CAPACITY"
 PYTHON_CMD="$PYTHON_CMD --uncontrolled-capacity $UNCONTROLLED_CAPACITY"
+PYTHON_CMD="$PYTHON_CMD --lru-capacity $LRU_CAPACITY"
 PYTHON_CMD="$PYTHON_CMD --score-percentile $SCORE_PERCENTILE"
 PYTHON_CMD="$PYTHON_CMD --prefetch-ratio $PREFETCH_RATIO"
 
@@ -109,6 +116,7 @@ echo "Max Requests:             $MAX_REQUESTS"
 echo "Output Path:              $OUTPUT_PATH"
 echo "Controlled Capacity:      $CONTROLLED_CAPACITY"
 echo "Uncontrolled Capacity:    $UNCONTROLLED_CAPACITY"
+echo "LRU Capacity:             $LRU_CAPACITY"
 echo "Score Percentile:         $SCORE_PERCENTILE"
 echo "Prefetch Ratio:           $PREFETCH_RATIO"
 echo "Background Refresh:       $ENABLE_BACKGROUND_REFRESH"

@@ -48,7 +48,7 @@ def _to_lines(df: pd.DataFrame, max_rows: int = 20) -> Iterable[str]:
         yield "No groups passed min_intervals filter."
         return
     cols = [
-        "chain_code",
+        "hotel_code",
         "lead_time",
         "rate_source",
         "n_intervals",
@@ -122,16 +122,16 @@ def run_smoke_km_lambda(
         elif partition_date:
             processed_df = processed_df[ts.dt.strftime("%Y-%m-%d") == partition_date].copy()
 
-    required = ["chain_code", "lead_time", "rate_source", "rq_timestamp", "price_change"]
+    required = ["hotel_code", "lead_time", "rate_source", "rq_timestamp", "price_change"]
     missing = [c for c in required if c not in processed_df.columns]
     if missing:
         raise ValueError(f"Input df is missing required columns: {missing}")
 
     processed_df["rq_timestamp"] = pd.to_datetime(processed_df["rq_timestamp"], errors="coerce", utc=True)
-    processed_df = processed_df.dropna(subset=["rq_timestamp", "chain_code", "lead_time", "rate_source"]).copy()
+    processed_df = processed_df.dropna(subset=["rq_timestamp", "hotel_code", "lead_time", "rate_source"]).copy()
 
     grouped_stats = (
-        processed_df.groupby(["chain_code", "lead_time", "rate_source"], dropna=False)
+        processed_df.groupby(["hotel_code", "lead_time", "rate_source"], dropna=False)
         .agg(obs_count=("price_change", "size"), price_change_count=("price_change", "sum"))
         .reset_index()
     )
