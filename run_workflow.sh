@@ -6,12 +6,13 @@
 set -e
 
 # Default values
-PARTITION_DATE="2026-02-07"
-MAX_REQUESTS=500
+START_DATE="2026-02-07"
+END_DATE="2026-02-07"
+MAX_REQUESTS=1000000
 OUTPUT_PATH="workflow_ttl_methods_eval_$(date +%Y-%m-%d_%H%M%S).txt"
-CONTROLLED_CAPACITY=50000
-UNCONTROLLED_CAPACITY=450000
-LRU_CAPACITY=500000
+CONTROLLED_CAPACITY=100
+UNCONTROLLED_CAPACITY=900
+LRU_CAPACITY=1000
 SCORE_PERCENTILE=0.7
 PREFETCH_RATIO=0.2
 ENABLE_BACKGROUND_REFRESH=false
@@ -19,8 +20,17 @@ ENABLE_BACKGROUND_REFRESH=false
 # Parse command line arguments
 while [[ $# -gt 0 ]]; do
     case $1 in
+        --start-date)
+            START_DATE="$2"
+            shift 2
+            ;;
+        --end-date)
+            END_DATE="$2"
+            shift 2
+            ;;
         --partition-date)
-            PARTITION_DATE="$2"
+            START_DATE="$2"
+            END_DATE="$2"
             shift 2
             ;;
         --max-requests)
@@ -59,7 +69,9 @@ while [[ $# -gt 0 ]]; do
             echo "Usage: ./run_workflow.sh [options]"
             echo ""
             echo "Options:"
-            echo "  --partition-date DATE              Partition date (default: 2026-02-07)"
+            echo "  --start-date DATE                  Start date (default: 2026-02-07)"
+            echo "  --end-date DATE                    End date (default: 2026-02-07)"
+            echo "  --partition-date DATE              Backward-compatible alias for single-day run"
             echo "  --max-requests NUM                 Max requests to sample (default: 10000000)"
             echo "  --output-path PATH                 Output file path (default: workflow_ttl_methods_eval_TIMESTAMP.txt)"
             echo "  --controlled-capacity NUM          Controlled cache capacity (default: 100)"
@@ -80,6 +92,9 @@ while [[ $# -gt 0 ]]; do
             echo "  # Run with specific partition date and request limit"
             echo "  ./run_workflow.sh --partition-date 2026-02-07 --max-requests 5000 --output-path my_result.txt"
             echo ""
+            echo "  # Run with a date range"
+            echo "  ./run_workflow.sh --start-date 2026-02-06 --end-date 2026-02-07 --max-requests 3000"
+            echo ""
             echo "  # Run with background refresh enabled"
             echo "  ./run_workflow.sh --enable-background-refresh"
             exit 0
@@ -94,7 +109,8 @@ done
 
 # Build the Python command
 PYTHON_CMD="python Cache_System_Workflow/cache_pipeline.py"
-PYTHON_CMD="$PYTHON_CMD --partition-date $PARTITION_DATE"
+PYTHON_CMD="$PYTHON_CMD --start-date $START_DATE"
+PYTHON_CMD="$PYTHON_CMD --end-date $END_DATE"
 PYTHON_CMD="$PYTHON_CMD --max-requests $MAX_REQUESTS"
 PYTHON_CMD="$PYTHON_CMD --output-path $OUTPUT_PATH"
 PYTHON_CMD="$PYTHON_CMD --controlled-capacity $CONTROLLED_CAPACITY"
@@ -111,7 +127,8 @@ fi
 echo "=========================================="
 echo "TTL Method Evaluation Workflow"
 echo "=========================================="
-echo "Partition Date:           $PARTITION_DATE"
+echo "Start Date:               $START_DATE"
+echo "End Date:                 $END_DATE"
 echo "Max Requests:             $MAX_REQUESTS"
 echo "Output Path:              $OUTPUT_PATH"
 echo "Controlled Capacity:      $CONTROLLED_CAPACITY"

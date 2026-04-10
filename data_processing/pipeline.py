@@ -41,6 +41,12 @@ class DataPipelineProcessor:
         # Step 1: Load raw data
         df = self._load_raw_data(partition_date, max_rows)
 
+        return self.process_dataframe(df)
+
+    def process_dataframe(self, df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        """Process an already-loaded raw dataframe into source and prepared features."""
+        df = df.copy()
+
         # Step 2: Data preprocessing (timestamps, lead_time, cache_key)
         df = self._preprocess_raw_data(df)
 

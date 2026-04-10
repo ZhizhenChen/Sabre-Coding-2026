@@ -245,6 +245,21 @@ def _build_ttl_lookup(source_df: pd.DataFrame, ttl_method: str) -> Dict[str, int
     raise ValueError(f"Unsupported ttl_method='{ttl_method}'. Use one of: glm, pp, rule_based, km")
 
 
+def _sample_raw_requests(raw_df: pd.DataFrame, max_requests: int | None = None) -> pd.DataFrame:
+    """Sample request rows before feature engineering."""
+    if raw_df.empty:
+        return raw_df.copy()
+
+    sampled = raw_df.copy()
+    sampled["rq_timestamp"] = pd.to_datetime(sampled["rq_timestamp"], errors="coerce", utc=True)
+    sampled = sampled.dropna(subset=["rq_timestamp"]).sort_values("rq_timestamp", kind="stable")
+
+    if max_requests is not None and max_requests > 0:
+        sampled = sampled.head(max_requests)
+
+    return sampled.reset_index(drop=True)
+
+
 def _prepare_requests(requests_df: pd.DataFrame, p_reuse_df: pd.DataFrame) -> List[PreparedWorkflowInput]:
     p_lookup = (
         p_reuse_df.dropna(subset=["cache_key", "p_reuse"])
@@ -456,6 +471,8 @@ def _run_lru_baseline(requests_df: pd.DataFrame, lru_capacity: int = 1000) -> LR
 
 def run_ttl_method_eval(
     partition_date: str = "2026-02-07",
+    start_date: str | None = None,
+    end_date: str | None = None,
     max_requests: int = 3000,
     output_path: str = "workflow_ttl_methods_eval_2026-02-07_3000.txt",
     controlled_capacity: int = 100,
@@ -466,7 +483,30 @@ def run_ttl_method_eval(
     enable_background_refresh: bool = False,
 ) -> None:
     processor = DataPipelineProcessor(data_root=str(ROOT_DIR / "data" / "cleaned_partitioned"))
-    source_df, prepared_df = processor.process(partition_date=partition_date, max_rows=max_requests)
+    raw_parts: List[pd.DataFrame] = []
+
+    if start_date and end_date:
+        date_list = pd.date_range(start=start_date, end=end_date, freq="D")
+        if len(date_list) == 0:
+            raise ValueError(f"No dates found between start_date={start_date} and end_date={end_date}.")
+        for dt in date_list:
+            day = dt.strftime("%Y-%m-%d")
+            day_raw_df = processor._load_raw_data(partition_date=day, max_rows=None)
+            day_raw_df["partition_date"] = day
+            raw_parts.append(day_raw_df)
+        raw_df = pd.concat(raw_parts, ignore_index=True)
+    else:
+        raw_df = processor._load_raw_data(partition_date=partition_date, max_rows=None)
+        raw_df["partition_date"] = partition_date
+
+    if raw_df.empty:
+        raise ValueError("No raw requests found for the requested date range.")
+
+    request_df = _sample_raw_requests(raw_df, max_requests=max_requests)
+    if request_df.empty:
+        raise ValueError("No request-level rows remained after sampling.")
+
+    source_df, prepared_df = processor.process_dataframe(request_df)
 
     if source_df.empty:
         raise ValueError(f"No requests found for {partition_date} after sampling {max_requests} rows.")
@@ -508,9 +548,14 @@ def run_ttl_method_eval(
 
     lines: List[str] = []
     lines.append("TTL METHOD EVAL (admission score uses TTL-implied lambda)")
-    lines.append(f"partition_date={partition_date}")
-    lines.append(f"sample_requests={len(source_df)}")
-    lines.append(f"unique_request_keys={source_df['cache_key'].nunique()}")
+    if start_date and end_date:
+        lines.append(f"start_date={start_date}")
+        lines.append(f"end_date={end_date}")
+    else:
+        lines.append(f"partition_date={partition_date}")
+    lines.append(f"sample_requests={len(request_df)}")
+    lines.append(f"unique_request_keys={request_df['cache_key'].nunique()}")
+    lines.append(f"source_rows_after_explode={len(source_df)}")
     lines.append(f"prepared_feature_rows={len(prepared_df)}")
     lines.append(f"p_reuse_rows={len(p_reuse_df)}")
     lines.append("")
@@ -547,6 +592,8 @@ def run_ttl_method_eval(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="TTL Method Evaluation with configurable cache parameters")
+    parser.add_argument("--start-date", default=None, help="Optional start date (YYYY-MM-DD)")
+    parser.add_argument("--end-date", default=None, help="Optional end date (YYYY-MM-DD)")
     parser.add_argument("--partition-date", default="2026-02-07", help="Partition date (default: 2026-02-07)")
     parser.add_argument("--max-requests", type=int, default=10000000, help="Max requests to sample (default: 10000000)")
     parser.add_argument("--output-path", default="workflow_ttl_methods_eval_2026-02-07_all.txt", help="Output file path")
@@ -561,6 +608,8 @@ if __name__ == "__main__":
     
     run_ttl_method_eval(
         partition_date=args.partition_date,
+        start_date=args.start_date,
+        end_date=args.end_date,
         max_requests=args.max_requests,
         output_path=args.output_path,
         controlled_capacity=args.controlled_capacity,
