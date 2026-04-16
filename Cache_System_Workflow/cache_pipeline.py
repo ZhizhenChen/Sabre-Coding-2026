@@ -89,6 +89,8 @@ def _build_truth_price_lookup(source_df: pd.DataFrame) -> Dict[str, List[Dict[st
         raise ValueError("source_df must include rate_source before building truth prices")
 
     lookup: Dict[str, List[Dict[str, Any]]] = {}
+
+    df = source_df.dropna(subset=["convertedrate_infos", "cache_key"])
     for cache_key, group in source_df.dropna(subset=["cache_key", "price", "rate_source"]).groupby("cache_key", dropna=False):
         # For each cache_key, collect all unique source-price pairs (take minimum price per source)
         offers = []
