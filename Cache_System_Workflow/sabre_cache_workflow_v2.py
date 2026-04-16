@@ -211,6 +211,7 @@ class SabreCacheWorkflow:
         self._score_history: Deque[float] = deque(maxlen=score_history_size)
         self._theta: float = 0.0
         self._maintenance_thread: Optional[threading.Thread] = None
+        self._provider_call_counts: Dict[str, int] = {"refresh": 0, "prefetch": 0, "miss": 0}
 
         if self.enable_background_refresh:
             self._maintenance_thread = threading.Thread(
@@ -347,6 +348,14 @@ class SabreCacheWorkflow:
         entry.last_access_time = now
         entry.recent_freq += 1
 
+    def _record_provider_call(self, kind: str) -> None:
+        with self._lock:
+            self._provider_call_counts[kind] = self._provider_call_counts.get(kind, 0) + 1
+
+    def provider_call_counts(self) -> Dict[str, int]:
+        with self._lock:
+            return dict(self._provider_call_counts)
+
     def _purge_expired_entries(self, now: datetime) -> None:
         with self._lock:
             controlled_keys = [key for key, entry in self._controlled.items() if not self._is_valid_entry(entry, now)]
@@ -368,6 +377,7 @@ class SabreCacheWorkflow:
                     del self._controlled[key]
                     continue
 
+                self._record_provider_call("refresh")
                 payload = provider(entry.request)
                 entry.payload = payload
                 entry.expires_at = now + timedelta(
@@ -497,6 +507,7 @@ class SabreCacheWorkflow:
                 theta=theta,
             )
 
+        self._record_provider_call("miss")
         payload = provider(request)
         controlled_ttl = self._compute_controlled_ttl(request, lambda_i, request_now)
         uncontrolled_ttl = self._compute_uncontrolled_ttl(request, lambda_i, request_now)
@@ -598,6 +609,7 @@ class SabreCacheWorkflow:
         admitted_keys: List[str] = []
         for request, p_reuse, lambda_i in selected:
             key = request.cache_key()
+            self._record_provider_call("prefetch")
             payload = provider(request)
             ttl = self._compute_controlled_ttl(request, lambda_i, request.rq_timestamp)
             entry = CacheEntry(

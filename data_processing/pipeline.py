@@ -25,13 +25,14 @@ class DataPipelineProcessor:
         """
         self.data_root = Path(data_root)
 
-    def process(self, partition_date: str, max_rows: Optional[int] = None) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    def process(self, start_date: str, end_date: str, max_requests: int | None = None) -> Tuple[pd.DataFrame, pd.DataFrame]:
         """
-        Main entry point: load data for a date and produce prepared features.
+        Main entry point: load data for a date range and produce prepared features.
 
         Args:
-            partition_date: Date string (e.g., '2026-02-07')
-            max_rows: Optional row limit for testing/sampling
+            start_date: Start date string (e.g., '2026-02-07')
+            end_date: End date string (e.g., '2026-02-07')
+            max_requests: Optional row limit for testing/sampling
 
         Returns:
             (source_df, prepared_df) where:
@@ -39,13 +40,10 @@ class DataPipelineProcessor:
             - prepared_df: hourly-aggregated features with all engineered columns
         """
         # Step 1: Load raw data
-        df = self._load_raw_data(partition_date, max_rows)
+        df = self._load_raw_data(start_date, end_date)
 
-        return self.process_dataframe(df)
-
-    def process_dataframe(self, df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
-        """Process an already-loaded raw dataframe into source and prepared features."""
-        df = df.copy()
+        # Step 1.5: sampling for testing
+        df = self._sample_raw_requests(df, max_requests=max_requests)
 
         # Step 2: Data preprocessing (timestamps, lead_time, cache_key)
         df = self._preprocess_raw_data(df)
@@ -65,31 +63,45 @@ class DataPipelineProcessor:
 
         return source_df, prepared_df
 
-    def _load_raw_data(self, partition_date: str, max_rows: Optional[int] = None) -> pd.DataFrame:
-        """Load parquet data for specific partition date."""
-        path = self.data_root / f"date={partition_date}"
-        
-        if not path.exists():
-            raise FileNotFoundError(f"Partition path not found: {path}")
-
-        # Find all parquet files
-        parquet_files = list(path.glob("*.parquet"))
-        if not parquet_files:
-            raise FileNotFoundError(f"No parquet files found in {path}")
-
+    def _load_raw_data(self, start_date: str, end_date: str) -> pd.DataFrame:
+        """Load parquet data for specific date range."""
+        date_list = pd.date_range(start=start_date, end=end_date, freq="D")
+        if len(date_list) == 0:
+            raise ValueError(f"No dates found between start_date={start_date} and end_date={end_date}.")
         dfs = []
-        for pf in parquet_files:
-            df = pd.read_parquet(pf)
-            if max_rows:
-                df = df.head(max_rows)
-            dfs.append(df)
+        for dt in date_list:
+            day = dt.strftime("%Y-%m-%d")
+            path = self.data_root / f"date={day}"
+            if not path.exists():
+                raise FileNotFoundError(f"Partition path not found: {path}")
 
-        df = pd.concat(dfs, ignore_index=True)
-        if max_rows:
-            df = df.head(max_rows)
+            # Find all parquet files
+            parquet_files = list(path.glob("*.parquet"))
+            if not parquet_files:
+                raise FileNotFoundError(f"No parquet files found in {path}")
+            for pf in parquet_files:
+                df = pd.read_parquet(pf)
+                dfs.append(df)
+                
+        total_df = pd.concat(dfs, ignore_index=True) 
 
-        return df
+        return total_df
 
+
+    def _sample_raw_requests(self, raw_df: pd.DataFrame, max_requests: int | None = None) -> pd.DataFrame:
+        """Sample request rows before feature engineering."""
+        if raw_df.empty:
+            return raw_df.copy()
+
+        sampled = raw_df.copy()
+        sampled["rq_timestamp"] = pd.to_datetime(sampled["rq_timestamp"], errors="coerce", utc=True)
+        sampled = sampled.dropna(subset=["rq_timestamp"]).sort_values("rq_timestamp", kind="stable")
+
+        if max_requests is not None and max_requests > 0:
+            sampled = sampled.head(max_requests)
+
+        return sampled.reset_index(drop=True)
+    
     def _preprocess_raw_data(self, df: pd.DataFrame) -> pd.DataFrame:
         """Convert timestamps, compute lead_time, cache_key, hour."""
         df = df.copy()
@@ -211,8 +223,6 @@ class DataPipelineProcessor:
         #     df['location_latitude'].astype(str) + '_' +
         #     df['location_longitude'].astype(str)
         # )
-
-        # add start date
         df = df.sort_values(['hotel_code', 'lead_time'])
         df['price_change'] = (
             df.groupby(['hotel_code', 'lead_time', 'rate_source'])['price_per_day']
