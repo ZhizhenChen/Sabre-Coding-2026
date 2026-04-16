@@ -213,96 +213,109 @@ class DataPipelineProcessor:
             .astype(int)
         )
         return df
-
-    def _create_hourly_features(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Aggregate row-level data to hourly features."""
-        source_df_copy = df.copy()
-        source_df_copy['rq_timestamp'] = pd.to_datetime(source_df_copy['rq_timestamp'], utc=True)
-        source_df_copy['timestamp_hour'] = source_df_copy['rq_timestamp'].dt.floor('h')
-
-        # Request-level deduplication
-        if 'rq_correlation_id' in source_df_copy.columns:
-            request_level = source_df_copy.drop_duplicates(subset=['rq_correlation_id']).copy()
+    
+    # ====================================================
+    # Helper Methods for Feature Engineering (DeepAR Pipeline)
+    # ====================================================
+    @staticmethod
+    def assign_geo_grid(df: pd.DataFrame, precision: int = 2) -> pd.DataFrame:
+        """
+        Creates 'geo_grid_auto' based on latitude and longitude.
+        Rounds coordinates to group nearby hotels into spatial grids.
+        """
+        df = df.copy()
+        if 'location_latitude' in df.columns and 'location_longitude' in df.columns:
+            # Round coordinates to create a grid (precision=2 is approx 1.1km)
+            lat_grid = df['location_latitude'].round(precision).astype(str)
+            lon_grid = df['location_longitude'].round(precision).astype(str)
+            df['geo_grid_auto'] = "Grid_" + lat_grid + "_" + lon_grid
         else:
-            request_level = source_df_copy.copy()
+            df['geo_grid_auto'] = 'Missing_Grid'
+        
+        df['geo_grid_auto'] = df['geo_grid_auto'].fillna('Missing_Grid')
+        return df
 
-        request_level['request_count'] = 1
+    @staticmethod
+    def get_ap_bucket_label(ap):
+        """Assigns Advanced Purchase (AP) days to categorical buckets."""
+        if pd.isna(ap) or ap < 0: return "Exclude"
+        if ap <= 10: return f"AP_{int(ap):02d}"
+        for high in range(15, 51, 5):
+            if ap <= high: return f"AP_{high-4:02d}-{high:02d}"
+        return "AP_>50"
 
-        # Aggregate to cache_key + hour
-        hourly = (
-            request_level.groupby(['cache_key', 'timestamp_hour'], dropna=False)
-            .agg(
-                request_count=('request_count', 'sum'),
-                lead_time=('lead_time', 'median'),
-            )
-            .reset_index()
-            .sort_values(['cache_key', 'timestamp_hour'])
-            .reset_index(drop=True)
+    @staticmethod
+    def get_duration_bucket_label(stay):
+        """Assigns stay duration to categorical buckets."""
+        if pd.isna(stay) or stay <= 0: return "Exclude"
+        if stay <= 7: return f"Stay_{int(stay)}"
+        return "Stay_>7"
+
+    @staticmethod
+    def get_rating_bucket_label(rating):
+        """Assigns Sabre hotel ratings to categorical buckets."""
+        if pd.isna(rating): return "Rate_NA"
+        try: r = float(rating)
+        except: return "Rate_NA"
+        if r <= 1.5: return "Rate_1-1.5"
+        elif 2.0 <= r <= 2.5: return "Rate_2-2.5"
+        elif 3.0 <= r <= 3.5: return "Rate_3-3.5"
+        elif 4.0 <= r <= 4.5: return "Rate_4-4.5"
+        elif r == 5.0: return "Rate_5"
+        else: return "Exclude"
+
+    # ====================================================
+    # Hourly Feature Generation (DeepAR Optimized)
+    # ====================================================
+    def _create_hourly_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Data preparation formatted specifically for DeepAR Walk-Forward inference.
+        Applies strict bucketing and drops missing values. 
+        Note: Manual lag features are omitted as DeepAR's LSTM handles temporal context internally.
+        """
+        source_df_copy = df.copy()
+
+        # 1. Map variable names to match the forecasting pipeline
+        if 'AP' not in source_df_copy.columns and 'lead_time' in source_df_copy.columns:
+            source_df_copy['AP'] = source_df_copy['lead_time']
+        if 'stay_duration' not in source_df_copy.columns and 'duration' in source_df_copy.columns:
+            source_df_copy['stay_duration'] = source_df_copy['duration']
+
+        # 2. Generate spatial grid (geo_grid_auto)
+        source_df_copy = self.assign_geo_grid(source_df_copy)
+
+        # 3. Purge rows with missing essential attributes (Crucial for clean DeepAR inference)
+        source_df_copy = source_df_copy.dropna(subset=['sabre_rating', 'chain_code', 'stay_duration', 'AP'])
+
+        # 4. Apply categorical bucketing
+        source_df_copy['AP_bucket'] = source_df_copy['AP'].apply(self.get_ap_bucket_label)
+        source_df_copy['stay_bucket'] = source_df_copy['stay_duration'].apply(self.get_duration_bucket_label)
+        source_df_copy['rating_bucket'] = source_df_copy['sabre_rating'].apply(self.get_rating_bucket_label)
+        
+        # Chain bucketing (Top 50 logic)
+        top_50_chains = set(source_df_copy['chain_code'].value_counts().nlargest(50).index.tolist())
+        source_df_copy['chain_bucket'] = source_df_copy['chain_code'].apply(
+            lambda x: f"Chain_{x}" if x in top_50_chains else 'Chain_others'
         )
 
-        # Fill continuous hour series
-        frames = []
-        for cache_key, group in hourly.groupby('cache_key'):
-            group = group.sort_values('timestamp_hour').set_index('timestamp_hour')
-            full_index = pd.date_range(group.index.min(), group.index.max(), freq='h', tz='UTC')
-            expanded = group.reindex(full_index)
-            expanded['cache_key'] = cache_key
-            expanded['request_count'] = expanded['request_count'].fillna(0)
-            expanded['lead_time'] = expanded['lead_time'].ffill().bfill().fillna(0)
-            expanded = expanded.reset_index().rename(columns={'index': 'timestamp_hour'})
-            frames.append(expanded)
+        # Remove "Exclude" buckets
+        for col in ['AP_bucket', 'stay_bucket', 'rating_bucket', 'chain_bucket']:
+            source_df_copy = source_df_copy[source_df_copy[col] != "Exclude"]
 
-        df_hourly = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(
-            columns=['cache_key', 'timestamp_hour', 'request_count', 'lead_time']
-        )
+        source_df_copy = source_df_copy[source_df_copy['geo_grid_auto'] != 'Unknown']
 
-        # Temporal features
-        df_hourly['hour_of_day'] = df_hourly['timestamp_hour'].dt.hour
-        df_hourly['day_of_week'] = df_hourly['timestamp_hour'].dt.dayofweek
-        df_hourly['is_weekend'] = (df_hourly['day_of_week'] >= 5).astype(int)
-        df_hourly['is_holiday'] = 0
+        # 5. Create conditional keys specific to DeepAR logic
+        source_df_copy['rating_loc'] = source_df_copy['rating_bucket'].astype(str) + "_|_" + source_df_copy['geo_grid_auto'].astype(str)
+        source_df_copy['rating_chain'] = source_df_copy['rating_bucket'].astype(str) + "_|_" + source_df_copy['chain_bucket'].astype(str)
 
-        # Lags and rolling features
-        df_hourly = df_hourly.sort_values(['cache_key', 'timestamp_hour'])
-        df_hourly['lag_1h'] = df_hourly.groupby('cache_key')['request_count'].shift(1).fillna(0)
-        df_hourly['lag_2h'] = df_hourly.groupby('cache_key')['request_count'].shift(2).fillna(0)
-        df_hourly['past_3h'] = (
-            df_hourly.groupby('cache_key')['request_count']
-            .rolling(3).sum().reset_index(level=0, drop=True).fillna(0)
-        )
-        df_hourly['past_6h'] = (
-            df_hourly.groupby('cache_key')['request_count']
-            .rolling(6).sum().reset_index(level=0, drop=True).fillna(0)
-        )
+        source_df_copy['timestamp_hour'] = pd.to_datetime(source_df_copy['rq_timestamp'], utc=True).dt.floor('h')
 
-        # Request time gap
-        df_hourly['last_request_time'] = (
-            df_hourly.groupby('cache_key')['timestamp_hour']
-            .transform(lambda x: x.where(df_hourly.loc[x.index, 'request_count'] > 0).ffill())
-        )
-        df_hourly['request_time_gap'] = (
-            (df_hourly['timestamp_hour'] - df_hourly['last_request_time']).dt.total_seconds() / 3600.0
-        ).fillna(999.0)
+        # 6. Aggregate demand by all DeepAR target attributes
+        deepar_features = [
+            'geo_grid_auto', 'AP_bucket', 'stay_bucket', 'rating_bucket', 
+            'chain_bucket', 'rating_loc', 'rating_chain'
+        ]
+        
+        prepared_df = source_df_copy.groupby(['timestamp_hour'] + deepar_features).size().reset_index(name='demand')
 
-        # Interaction features
-        df_hourly['leadtime_x_recent'] = df_hourly['lead_time'] * df_hourly['lag_1h']
-        df_hourly['recent_and_close'] = (
-            (df_hourly['lag_1h'] > 0) & (df_hourly['lead_time'] <= 1)
-        ).astype(int)
-
-        # Lead time bucket
-        df_hourly['lead_time_bucket'] = pd.cut(
-            df_hourly['lead_time'],
-            bins=[-1, 1, 3, 7, 30, 365],
-            labels=['same_day', 'short', 'mid', 'long', 'very_long'],
-        )
-        df_hourly['lead_time_bucket'] = (
-            df_hourly['lead_time_bucket'].astype('object').fillna('very_long').astype('category')
-        )
-
-        # Target-aligned bookkeeping
-        df_hourly['next_hour_request_count'] = (
-            df_hourly.groupby('cache_key')['request_count'].shift(-1).fillna(0)
-        )
-
-        return df_hourly
+        return prepared_df.sort_values('timestamp_hour').reset_index(drop=True)
