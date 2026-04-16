@@ -481,7 +481,11 @@ def run_ttl_method_eval(
 
     source_df, prepared_df = processor.process(start_date=start_date, end_date=end_date, max_requests=max_requests)
 
-    model_generator = DemandScoreGenerator(model_path=str(ROOT_DIR / "demand_forecasting" / "xgb_model.json"))
+    # Build a dedicated frame for price-truth and lambda estimation only.
+    pricing_source_df = processor._process_rates_and_prices(source_df.copy())
+    pricing_source_df = processor._compute_market_and_price_change(pricing_source_df)
+
+    model_generator = DemandScoreGenerator()
     p_reuse_df = model_generator.generate_demand_scores(
         processed_df=prepared_df,
         source_df=source_df,
@@ -489,7 +493,7 @@ def run_ttl_method_eval(
         output_parquet=None,
     )
 
-    truth_price_by_key = _build_truth_price_lookup(source_df)
+    truth_price_by_key = _build_truth_price_lookup(pricing_source_df)
     prepared_requests = _prepare_requests(source_df, p_reuse_df)
     lru_summary = _run_lru_baseline(source_df, lru_capacity=lru_capacity)
 
@@ -498,7 +502,7 @@ def run_ttl_method_eval(
     ttl_lookups: Dict[str, Dict[str, int]] = {}
 
     for method in ttl_methods:
-        ttl_lookup = _build_ttl_lookup(source_df, ttl_method=method)
+        ttl_lookup = _build_ttl_lookup(pricing_source_df, ttl_method=method)
         ttl_lookups[method] = ttl_lookup
         evals.append(
             _run_ttl_method(
@@ -524,7 +528,7 @@ def run_ttl_method_eval(
 
     lines.append(f"sample_requests={len(source_df)}")
     lines.append(f"unique_request_keys={source_df['cache_key'].nunique()}")
-    lines.append(f"source_rows_after_explode={len(source_df)}")
+    lines.append(f"source_rows_after_explode={len(pricing_source_df)}")
     lines.append(f"prepared_feature_rows={len(prepared_df)}")
     lines.append(f"p_reuse_rows={len(p_reuse_df)}")
     lines.append("")

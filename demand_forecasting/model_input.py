@@ -1,328 +1,173 @@
 from __future__ import annotations
 
-import json
-from typing import Any, Dict, Optional
+from pathlib import Path
+import importlib
+from typing import Dict, Optional
 
 import numpy as np
 import pandas as pd
 
-XGBOOST_AVAILABLE = False
-xgb = None
-_XGBOOST_IMPORT_ATTEMPTED = False
-
-
-def _lazy_import_xgboost() -> bool:
-    """Lazily import xgboost on first use (on-demand, not at module load)."""
-    global XGBOOST_AVAILABLE, xgb, _XGBOOST_IMPORT_ATTEMPTED
-    
-    if _XGBOOST_IMPORT_ATTEMPTED:
-        return XGBOOST_AVAILABLE
-    
-    _XGBOOST_IMPORT_ATTEMPTED = True
-    try:
-        import xgboost as xgb_temp
-        xgb = xgb_temp
-        XGBOOST_AVAILABLE = True
-        print("✓ XGBoost successfully imported")
-        return True
-    except Exception as e:
-        print(f"⚠ XGBoost import failed: {e}")
-        print("Falling back to heuristic scoring...\n")
-        return False
+from demand_forecasting.feature_rules import (
+    ap_bucket_label,
+    build_geo_grid_series,
+    duration_bucket_label,
+    rating_bucket_label,
+)
 
 
 class DemandScoreGenerator:
-    """Load XGBoost model, predict next-hour count, then map count to demand probability."""
+    """
+    Demand score generator backed by four GluonTS checkpoints.
 
-    MODEL_FEATURES = [
-        "lag_1h",
-        "lag_2h",
-        "past_3h",
-        "past_6h",
-        "request_time_gap",
-        "hour_of_day",
-        "day_of_week",
-        "is_weekend",
-        "is_holiday",
-        "lead_time",
-        "leadtime_x_recent",
-        "recent_and_close",
-        "lead_time_bucket",
-    ]
+    The final request score is:
+        p_reuse = score_ap * score_location * score_duration * score_rating_loc
 
-    LEAD_TIME_BINS = [-1, 1, 3, 7, 30, 365]
-    LEAD_TIME_LABELS = ["same_day", "short", "mid", "long", "very_long"]
-    REQUIRED_BASE_COLUMNS = ["cache_key", "timestamp_hour", "request_count"]
+    Scores are derived from each checkpoint's one-step demand forecast and
+    squashed to (0, 1) by x / (1 + x).
+    """
 
-    def __init__(self, model_path: str = "xgb_model.json") -> None:
-        """Initialize the demand forecaster model.
-
-        Args:
-            model_path: Path to the XGBoost model JSON file.
-        """
-        self.model_path = model_path
-        self.model = None
-        self.model_features = None
-        
-        # Try lazy-loaded xgboost
-        if _lazy_import_xgboost():
-            try:
-                self.model = xgb.Booster()
-                self.model.load_model(model_path)
-                print(f"✓ XGBoost model loaded from {model_path}")
-            except Exception as e:
-                print(f"Warning: Failed to load XGBoost model: {e}")
-                print("Using fallback scoring method.")
-                self._load_model_metadata(model_path)
-        else:
-            self._load_model_metadata(model_path)
-    
-    def _load_model_metadata(self, model_path: str) -> None:
-        """Load model feature names and metadata from JSON for fallback inference."""
-        try:
-            with open(model_path, 'r') as f:
-                model_json = json.load(f)
-                if 'learner' in model_json:
-                    features = model_json['learner'].get('feature_names', [])
-                    self.model_features = features
-                    print(f"✓ Loaded model metadata with {len(features)} features")
-        except Exception as e:
-            print(f"Warning: Could not load model metadata: {e}")
-
-    def _build_hourly_feature_frame(self, processed_df: pd.DataFrame) -> pd.DataFrame:
-        """Validate and return a pre-built hourly feature frame from data pipeline."""
-        frame = processed_df.copy()
-        required = self.REQUIRED_BASE_COLUMNS + self.MODEL_FEATURES
-        missing = [c for c in required if c not in frame.columns]
-        if missing:
-            raise ValueError(
-                "Input dataframe is missing required prepared columns. "
-                f"Move preprocessing to data_pipeline.ipynb. Missing: {missing}"
-            )
-
-        if not pd.api.types.is_datetime64_any_dtype(frame["timestamp_hour"]):
-            raise ValueError(
-                "Column 'timestamp_hour' must be datetime dtype prepared in data_pipeline.ipynb."
-            )
-
-        numeric_features = [c for c in self.MODEL_FEATURES if c != "lead_time_bucket"]
-        non_numeric = [c for c in numeric_features if not pd.api.types.is_numeric_dtype(frame[c])]
-        if non_numeric:
-            raise ValueError(
-                "Numeric model features must be precomputed as numeric dtypes in data_pipeline.ipynb. "
-                f"Non-numeric columns: {non_numeric}"
-            )
-
-        if not pd.api.types.is_categorical_dtype(frame["lead_time_bucket"]):
-            raise ValueError(
-                "Column 'lead_time_bucket' must be categorical dtype prepared in data_pipeline.ipynb."
-            )
-
-        return frame
-
-    def extract_features(self, processed_df: pd.DataFrame) -> pd.DataFrame:
-        """Select model features from a prepared hourly dataframe."""
-        feature_frame = self._build_hourly_feature_frame(processed_df)
-        return feature_frame[self.MODEL_FEATURES].copy()
-
-    @staticmethod
-    def _compute_lead_time_weight(lead_time: int) -> float:
-        """Compute exponential decay weight for lead_time (from demand_forecasting.ipynb)."""
-        if lead_time <= 50:
-            return float(np.exp(-lead_time / 20))
-        else:
-            return 0.05
-
-    def _fallback_demand_score_predictor(self, feature_frame: pd.DataFrame, processed_df: pd.DataFrame) -> pd.Series:
-        """Fallback predictor using demand_score method: chain × duration × lead_time × rating.
-        
-        Based on demand_forecasting.ipynb weighted scoring approach.
-        """
-        # # If source_df not available, fall back to simple heuristic
-        # if not hasattr(self, '_source_df_for_fallback') or self._source_df_for_fallback is None:
-        #     pred = (
-        #         0.45 * feature_frame["lag_1h"]
-        #         + 0.25 * feature_frame["lag_2h"]
-        #         + 0.2 * (feature_frame["past_3h"] / 3.0)
-        #         + 0.1 * (feature_frame["past_6h"] / 6.0)
-        #     )
-        #     pred = np.maximum(pred, 0.6 * feature_frame["request_count"])
-        #     return pd.Series(pred, index=feature_frame.index)
-        
-        # Use source_df to compute demand score weights
-        source = self._source_df_for_fallback[['cache_key', 'chain_code', 'duration', 'lead_time', 'sabre_rating']].copy()
-        
-        # 1. Chain weight: log1p normalization of chain frequencies
-        chain_counts = source['chain_code'].value_counts()
-        chain_weight_map = np.log1p(chain_counts) / np.log1p(chain_counts).max()
-        source['chain_weight'] = source['chain_code'].map(chain_weight_map).fillna(0.0)
-        
-        # 2. Duration weight: log1p normalization of duration frequencies
-        duration_counts = source['duration'].value_counts()
-        duration_weight_map = np.log1p(duration_counts) / np.log1p(duration_counts).max()
-        source['duration_weight'] = source['duration'].map(duration_weight_map).fillna(0.0)
-        
-        # 3. Lead time weight: exponential decay
-        source['lead_time_weight'] = source['lead_time'].apply(self._compute_lead_time_weight)
-        
-        # 4. Rating weight: log1p normalization of rating frequencies
-        rating_counts = source['sabre_rating'].value_counts()
-        rating_weight_map = np.log1p(rating_counts) / np.log1p(rating_counts).max()
-        source['rating_weight'] = source['sabre_rating'].map(rating_weight_map).fillna(0.0)
-        
-        # 5. Compute demand score as product of all weights
-        source['demand_score'] = (
-            source['chain_weight'] * 
-            source['duration_weight'] * 
-            source['lead_time_weight'] * 
-            source['rating_weight']
-        )
-        
-        # Aggregate by cache_key: mean of demand_score
-        source_agg = source.groupby('cache_key')[['demand_score']].mean().reset_index()
-        
-        # Merge with feature_frame on cache_key
-        feature_frame = feature_frame.merge(source_agg, on='cache_key', how='left')
-        feature_frame['demand_score'] = feature_frame['demand_score'].fillna(0.5)  # Default to 0.5
-        
-        # Compute prediction: demand_score * request_count + 0.6 * request_count
-        pred = (
-            feature_frame['demand_score'].values * feature_frame['request_count'].values +
-            0.6 * feature_frame['request_count'].values
-        )
-        
-        return pd.Series(pred, index=feature_frame.index)
-
-    def predict_next_hour_request_count(self, processed_df: pd.DataFrame) -> pd.DataFrame:
-        """Predict next_hour_request_count on a prepared hourly feature frame."""
-        feature_frame = self._build_hourly_feature_frame(processed_df)
-        X = self.extract_features(feature_frame)
-
-        if self.model is not None:
-            try:
-                d_matrix = xgb.DMatrix(X, enable_categorical=True)
-                pred = self.model.predict(d_matrix)
-                feature_frame["pred_next_hour_request_count"] = np.maximum(pred, 0.0)
-                return feature_frame
-            except Exception as e:
-                print(f"Warning: XGBoost prediction failed: {e}")
-                print("Falling back to heuristic next-hour count.")
-
-        # Fallback: demand_score based predictor (from demand_forecasting.ipynb)
-        pred = self._fallback_demand_score_predictor(feature_frame, processed_df)
-        feature_frame["pred_next_hour_request_count"] = np.maximum(pred.values, 0.0)
-        return feature_frame
-
-    @staticmethod
-    def count_to_probability(counts: np.ndarray, method: str = "log_minmax") -> np.ndarray:
-        """Convert predicted count to demand score (probability in [0, 1]).
-
-        methods:
-        - minmax: plain min-max scaling
-        - log_minmax: log1p then min-max scaling (recommended)
-        """
-        counts = np.nan_to_num(np.asarray(counts, dtype=float), nan=0.0, posinf=0.0, neginf=0.0)
-        counts = np.maximum(counts, 0.0)
-
-        if method == "minmax":
-            transformed = counts
-        else:
-            transformed = np.log1p(counts)
-
-        mn = float(np.min(transformed)) if transformed.size else 0.0
-        mx = float(np.max(transformed)) if transformed.size else 0.0
-        if mx <= mn:
-            return np.zeros_like(transformed)
-        return (transformed - mn) / (mx - mn)
-
-    @staticmethod
-    def validate_scores(scores: np.ndarray, min_val: float = 0.0, max_val: float = 1.0) -> np.ndarray:
-        """Validate and clamp demand scores to valid range.
-
-        Args:
-            scores: Array of predicted scores.
-            min_val: Minimum valid value (default 0.0).
-            max_val: Maximum valid value (default 1.0).
-
-        Returns:
-            Validated scores clamped to [min_val, max_val].
-        """
-        # Replace NaN and inf with 0
-        scores = np.nan_to_num(scores, nan=0.0, posinf=max_val, neginf=min_val)
-
-        # Clamp to valid range
-        scores = np.clip(scores, min_val, max_val)
-
-        return scores
+    def __init__(self, model_path: Optional[str] = None, checkpoint_root: Optional[str] = None) -> None:
+        # Keep model_path for backward compatibility; this implementation ignores XGBoost.
+        _ = model_path
+        root = Path(checkpoint_root) if checkpoint_root else Path(__file__).resolve().parent
+        self.checkpoint_dirs: Dict[str, Path] = {
+            "AP_bucket": root / "checkpoint_model_AP",
+            "geo_grid_auto": root / "checkpoint_model_Location",
+            "stay_bucket": root / "checkpoint_model_duration",
+            "rating_loc": root / "checkpoint_model_rating_loc",
+        }
 
     def generate_demand_scores(
         self,
         processed_df: pd.DataFrame,
-        source_df: Optional[pd.DataFrame] = None,
+        source_df: pd.DataFrame,
         num_samples: Optional[int] = None,
-        prob_method: str = "log_minmax",
         output_parquet: Optional[str] = None,
     ) -> pd.DataFrame:
-        """Predict next-hour count and p_reuse on prepared hourly dataframe.
+        _ = num_samples
 
-        Args:
-            processed_df: Prepared hourly dataframe from data_pipeline.ipynb.
-            source_df: Optional row-level source data for fallback predictor weight calculation.
-            num_samples: Optional limit on samples.
-            prob_method: 'log_minmax' or 'minmax'.
-            output_parquet: Optional path to save results as Parquet.
+        required_processed = {"timestamp_hour", "demand", "AP_bucket", "geo_grid_auto", "stay_bucket", "rating_loc"}
+        missing_processed = required_processed - set(processed_df.columns)
+        if missing_processed:
+            raise ValueError(f"processed_df missing required columns: {sorted(missing_processed)}")
 
-        Returns:
-            DataFrame with input columns + pred_next_hour_request_count + p_reuse.
-        """
-        data_df = processed_df.copy()
-        if num_samples is not None:
-            data_df = data_df.head(num_samples).copy()
+        required_source = {"cache_key", "lead_time", "duration", "location_latitude", "location_longitude", "sabre_rating"}
+        missing_source = required_source - set(source_df.columns)
+        if missing_source:
+            raise ValueError(f"source_df missing required columns: {sorted(missing_source)}")
 
-        # Store source_df for fallback predictor if provided
-        self._source_df_for_fallback = source_df
+        predictors = self._load_predictors()
 
-        print("\nPredicting next_hour_request_count...")
-        result_df = self.predict_next_hour_request_count(data_df)
+        ap_scores = self._score_by_category(processed_df, "AP_bucket", predictors["AP_bucket"])
+        loc_scores = self._score_by_category(processed_df, "geo_grid_auto", predictors["geo_grid_auto"])
+        dur_scores = self._score_by_category(processed_df, "stay_bucket", predictors["stay_bucket"])
+        rating_loc_scores = self._score_by_category(processed_df, "rating_loc", predictors["rating_loc"])
 
-        print("\nMapping count to probability demand score...")
-        probs = self.count_to_probability(result_df["pred_next_hour_request_count"].values, method=prob_method)
-        result_df["p_reuse"] = self.validate_scores(probs)
+        request_frame = self._build_request_feature_frame(source_df)
 
-        # Print statistics
-        print("\n=== Predicted Count Statistics ===")
-        print(f"Mean pred count: {result_df['pred_next_hour_request_count'].mean():.4f}")
-        print(f"Median pred count: {result_df['pred_next_hour_request_count'].median():.4f}")
-        print(f"Min pred count: {result_df['pred_next_hour_request_count'].min():.4f}")
-        print(f"Max pred count: {result_df['pred_next_hour_request_count'].max():.4f}")
+        ap_default = self._default_score(ap_scores)
+        loc_default = self._default_score(loc_scores)
+        dur_default = self._default_score(dur_scores)
+        rating_loc_default = self._default_score(rating_loc_scores)
 
-        print("\n=== Demand Score Statistics ===")
-        print(f"Score method: {prob_method}")
-        print(f"Mean p_reuse: {result_df['p_reuse'].mean():.4f}")
-        print(f"Median p_reuse: {result_df['p_reuse'].median():.4f}")
-        print(f"Min p_reuse: {result_df['p_reuse'].min():.4f}")
-        print(f"Max p_reuse: {result_df['p_reuse'].max():.4f}")
-        print(f"Std p_reuse: {result_df['p_reuse'].std():.4f}")
+        request_frame["score_ap"] = request_frame["AP_bucket"].map(ap_scores).fillna(ap_default)
+        request_frame["score_location"] = request_frame["geo_grid_auto"].map(loc_scores).fillna(loc_default)
+        request_frame["score_duration"] = request_frame["stay_bucket"].map(dur_scores).fillna(dur_default)
+        request_frame["score_rating_loc"] = request_frame["rating_loc"].map(rating_loc_scores).fillna(rating_loc_default)
 
-        # Check for any scores outside valid range
-        invalid_count = ((result_df["p_reuse"] < 0.0) | (result_df["p_reuse"] > 1.0)).sum()
-        if invalid_count > 0:
-            print(f"Warning: {invalid_count} scores outside [0, 1] range (after validation)")
-        else:
-            print("All scores successfully validated to [0, 1] range")
+        request_frame["p_reuse"] = (
+            request_frame["score_ap"]
+            * request_frame["score_location"]
+            * request_frame["score_duration"]
+            * request_frame["score_rating_loc"]
+        ).clip(lower=0.0, upper=1.0)
+
+        result_cols = ["cache_key", "p_reuse", "score_ap", "score_location", "score_duration", "score_rating_loc"]
+        p_reuse_df = request_frame[result_cols].copy()
 
         if output_parquet:
-            result_df.to_parquet(output_parquet, compression="snappy")
-            print(f"\nResults saved to {output_parquet}")
+            Path(output_parquet).parent.mkdir(parents=True, exist_ok=True)
+            p_reuse_df.to_parquet(output_parquet, index=False)
 
-        return result_df
+        return p_reuse_df
 
+    def _load_predictors(self) -> Dict[str, object]:
+        try:
+            predictor_mod = importlib.import_module("gluonts.model.predictor")
+            Predictor = getattr(predictor_mod, "Predictor")
+        except Exception as exc:
+            raise ImportError("gluonts is required to load checkpoint models") from exc
 
-def main() -> None:
-    """Entrypoint disabled: use the class methods with a provided DataFrame."""
-    raise SystemExit("Use DemandScoreGenerator.generate_demand_scores(processed_df=...) with a prepared dataframe.")
+        predictors: Dict[str, object] = {}
+        for feature_name, checkpoint_dir in self.checkpoint_dirs.items():
+            if not checkpoint_dir.exists():
+                raise FileNotFoundError(f"Checkpoint folder not found: {checkpoint_dir}")
+            predictors[feature_name] = Predictor.deserialize(checkpoint_dir)
+        return predictors
 
+    def _score_by_category(self, processed_df: pd.DataFrame, category_col: str, predictor: object) -> Dict[str, float]:
+        category_scores: Dict[str, float] = {}
 
+        grouped = (
+            processed_df[["timestamp_hour", category_col, "demand"]]
+            .dropna(subset=["timestamp_hour", category_col])
+            .groupby([category_col, "timestamp_hour"], as_index=False)["demand"]
+            .sum()
+        )
 
-if __name__ == "__main__":
-    main()
+        for category, group in grouped.groupby(category_col):
+            score = self._forecast_score(group, predictor)
+            category_scores[str(category)] = score
+
+        return category_scores
+
+    def _forecast_score(self, group: pd.DataFrame, predictor: object) -> float:
+        try:
+            dataset_mod = importlib.import_module("gluonts.dataset.common")
+            ListDataset = getattr(dataset_mod, "ListDataset")
+        except Exception as exc:
+            raise ImportError("gluonts is required to build prediction datasets") from exc
+
+        ts = group.sort_values("timestamp_hour").set_index("timestamp_hour")["demand"].astype(float)
+        full_index = pd.date_range(ts.index.min(), ts.index.max(), freq="h", tz="UTC")
+        ts = ts.reindex(full_index).fillna(0.0)
+
+        if len(ts) < 2:
+            return float(ts.mean() / (1.0 + ts.mean()))
+
+        dataset = ListDataset([
+            {
+                "start": ts.index[0].to_period("h"),
+                "target": ts.to_numpy(dtype=np.float32),
+            }
+        ], freq="H")
+
+        try:
+            forecast = next(predictor.predict(dataset))
+            point = float(np.mean(forecast.mean))
+        except Exception:
+            point = float(ts.mean())
+
+        point = max(point, 0.0)
+        return float(point / (1.0 + point))
+
+    def _build_request_feature_frame(self, source_df: pd.DataFrame) -> pd.DataFrame:
+        frame = source_df.copy()
+
+        frame["AP_bucket"] = frame["lead_time"].apply(ap_bucket_label)
+        frame["stay_bucket"] = frame["duration"].apply(duration_bucket_label)
+        frame["rating_bucket"] = frame["sabre_rating"].apply(rating_bucket_label)
+        frame["geo_grid_auto"] = build_geo_grid_series(frame["location_latitude"], frame["location_longitude"])
+        frame["rating_loc"] = frame["rating_bucket"].astype(str) + "_|_" + frame["geo_grid_auto"].astype(str)
+
+        frame = frame[frame["AP_bucket"] != "Exclude"]
+        frame = frame[frame["stay_bucket"] != "Exclude"]
+        frame = frame[frame["rating_bucket"] != "Exclude"]
+
+        return frame
+
+    @staticmethod
+    def _default_score(score_map: Dict[str, float]) -> float:
+        if not score_map:
+            return 0.5
+        return float(np.mean(list(score_map.values())))
