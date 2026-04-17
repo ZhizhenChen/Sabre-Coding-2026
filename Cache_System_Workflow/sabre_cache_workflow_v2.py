@@ -171,8 +171,6 @@ class SabreCacheWorkflow:
         avg_entry_size_bytes: int = 1000,
         min_cache_util_fraction: float = 0.20,
         prefetch_ratio: float = 0.01,
-        refresh_interval_seconds: int = 60,
-        enable_background_refresh: bool = True,
         now_fn: Callable[[], datetime] = _utc_now,
     ) -> None:
         self.controlled_capacity = controlled_capacity
@@ -199,39 +197,51 @@ class SabreCacheWorkflow:
         self.min_cache_util_fraction = _clamp_01(min_cache_util_fraction)
         self.min_cache_util_mb = self.max_cache_size_mb * self.min_cache_util_fraction
         self.prefetch_ratio = prefetch_ratio
-        self.refresh_interval_seconds = refresh_interval_seconds
-        self.enable_background_refresh = enable_background_refresh
         self._now_fn = now_fn
         self._refresh_provider: Optional[TruthPriceProvider] = None
         self._lock = threading.RLock()
-        self._stop_event = threading.Event()
         self._controlled: OrderedDict[str, CacheEntry] = OrderedDict()
         self._controlled_min_heap: List[Tuple[float, str]] = []
         self._uncontrolled: OrderedDict[str, CacheEntry] = OrderedDict()
         self._score_history: Deque[float] = deque(maxlen=score_history_size)
         self._theta: float = 0.0
-        self._maintenance_thread: Optional[threading.Thread] = None
         self._provider_call_counts: Dict[str, int] = {"refresh": 0, "prefetch": 0, "miss": 0}
+        self._last_stay_date_purge_date: Optional[str] = None
 
-        if self.enable_background_refresh:
-            self._maintenance_thread = threading.Thread(
-                target=self._maintenance_loop,
-                name="sabre-cache-maintenance",
-                daemon=True,
-            )
-            self._maintenance_thread.start()
 
-    def _is_valid_entry(self, entry: CacheEntry, now: datetime) -> bool:
+    def _is_stay_date_expired(self, entry: CacheEntry, now: datetime) -> bool:
+        """Check if the stay start date has passed."""
         stay_start = _parse_yyyy_mm_dd(entry.request.stay_start_date)
         if stay_start is not None and now.date() > stay_start.date():
-            return False
-        return entry.expires_at > now
+            return True
+        return False
 
-    def _maintenance_loop(self) -> None:
-        while not self._stop_event.wait(self.refresh_interval_seconds):
-            sweep_now = self._now_fn()
-            self._refresh_controlled_entries(sweep_now)
-            self._purge_expired_entries(sweep_now)
+    def _is_ttl_expired(self, entry: CacheEntry, now: datetime) -> bool:
+        """Check if the TTL has expired."""
+        return entry.expires_at <= now
+
+    def _purge_stay_date_expired_entries(self, now: datetime) -> None:
+        """Purge entries with expired stay_start_date (once per day)."""
+        today = now.date().isoformat()
+        
+        # Only run once per day
+        if self._last_stay_date_purge_date == today:
+            return
+        
+        with self._lock:
+            # Purge controlled entries
+            controlled_keys = [key for key, entry in self._controlled.items() 
+                             if self._is_stay_date_expired(entry, now)]
+            for key in controlled_keys:
+                del self._controlled[key]
+            
+            # Purge uncontrolled entries
+            uncontrolled_keys = [key for key, entry in self._uncontrolled.items() 
+                               if self._is_stay_date_expired(entry, now)]
+            for key in uncontrolled_keys:
+                del self._uncontrolled[key]
+        
+        self._last_stay_date_purge_date = today
 
     def _compute_score(self, p_reuse: float, lambda_i: float) -> float:
         safe_lambda = max(float(lambda_i), self.score_lambda_floor)
@@ -356,44 +366,36 @@ class SabreCacheWorkflow:
         with self._lock:
             return dict(self._provider_call_counts)
 
-    def _purge_expired_entries(self, now: datetime) -> None:
-        with self._lock:
-            controlled_keys = [key for key, entry in self._controlled.items() if not self._is_valid_entry(entry, now)]
-            for key in controlled_keys:
-                del self._controlled[key]
-
-            uncontrolled_keys = [key for key, entry in self._uncontrolled.items() if not self._is_valid_entry(entry, now)]
-            for key in uncontrolled_keys:
-                del self._uncontrolled[key]
-
-    def _refresh_controlled_entries(self, now: datetime) -> None:
+    def _refresh_controlled_entries(self, entry: CacheEntry, key: str, now: datetime) -> None:
         provider = self._refresh_provider
         if provider is None:
             return
 
-        with self._lock:
-            for key, entry in list(self._controlled.items()):
-                if not self._is_valid_entry(entry, now):
-                    del self._controlled[key]
-                    continue
-
-                self._record_provider_call("refresh")
-                payload = provider(entry.request)
-                entry.payload = payload
-                entry.expires_at = now + timedelta(
-                    seconds=self._compute_controlled_ttl(entry.request, entry.lambda_i, now)
-                )
-                self._touch_entry(entry, now)
-                self._controlled.move_to_end(key)
+        if provider is not None:
+            self._record_provider_call("refresh")
+            payload = provider(entry.request)
+            entry.payload = payload
+            entry.expires_at = now + timedelta(
+                seconds=self._compute_controlled_ttl(entry.request, entry.lambda_i, now)
+            )
+        else:
+            # No provider available, remove the stale entry
+            del self._controlled[key]
+            return None
 
     def _get_from_controlled(self, key: str, now: datetime) -> Optional[CacheEntry]:
         with self._lock:
             entry = self._controlled.get(key)
             if entry is None:
                 return None
-            if not self._is_valid_entry(entry, now):
-                del self._controlled[key]
-                return None
+            # Check if stay date has expired
+            # if self._is_stay_date_expired(entry, now):
+            #     del self._controlled[key]
+            #     return None
+            # If TTL has expired, try to refresh on-hit
+            if self._is_ttl_expired(entry, now):
+                self._refresh_controlled_entries(entry, key, now)
+
             self._touch_entry(entry, now)
             self._controlled.move_to_end(key)
             return entry
@@ -403,9 +405,10 @@ class SabreCacheWorkflow:
             entry = self._uncontrolled.get(key)
             if entry is None:
                 return None
-            if not self._is_valid_entry(entry, now):
-                del self._uncontrolled[key]
-                return None
+            # Check if stay date has expired
+            # if self._is_stay_date_expired(entry, now):
+            #     del self._uncontrolled[key]
+            #     return None
             self._touch_entry(entry, now)
             self._uncontrolled.move_to_end(key)
             return entry
@@ -479,6 +482,10 @@ class SabreCacheWorkflow:
     ) -> WorkflowResult:
         self._refresh_provider = provider
         request_now = request.rq_timestamp
+        
+        # Purge stay-date expired entries if date has changed
+        self._purge_stay_date_expired_entries(request_now)
+        
         key = request.cache_key()
         score = self._compute_score(p_reuse, lambda_i)
         theta = self._update_theta(score)
@@ -558,27 +565,27 @@ class SabreCacheWorkflow:
             theta=theta,
         )
 
-    def run_prepared_requests(
-        self,
-        prepared_requests: List[PreparedWorkflowInput],
-        provider: TruthPriceProvider,
-    ) -> List[WorkflowResult]:
-        """Run cache workflow on upstream-prepared request records.
+    # def run_prepared_requests(
+    #     self,
+    #     prepared_requests: List[PreparedWorkflowInput],
+    #     provider: TruthPriceProvider,
+    # ) -> List[WorkflowResult]:
+    #     """Run cache workflow on upstream-prepared request records.
 
-        This is the integration point for data_pipeline.ipynb, model_input.py,
-        and lambda_model.py: the caller prepares RequestContext, p_reuse, and
-        lambda_i before invoking the workflow.
-        """
-        results: List[WorkflowResult] = []
-        for item in prepared_requests:
-            result = self.get(
-                request=item.request,
-                p_reuse=item.p_reuse,
-                lambda_i=item.lambda_i,
-                provider=provider,
-            )
-            results.append(result)
-        return results
+    #     This is the integration point for data_pipeline.ipynb, model_input.py,
+    #     and lambda_model.py: the caller prepares RequestContext, p_reuse, and
+    #     lambda_i before invoking the workflow.
+    #     """
+    #     results: List[WorkflowResult] = []
+    #     for item in prepared_requests:
+    #         result = self.get(
+    #             request=item.request,
+    #             p_reuse=item.p_reuse,
+    #             lambda_i=item.lambda_i,
+    #             provider=provider,
+    #         )
+    #         results.append(result)
+    #     return results
 
     def prefetch_controlled(
         self,
@@ -640,12 +647,6 @@ class SabreCacheWorkflow:
             self._uncontrolled.clear()
             self._score_history.clear()
             self._theta = 0.0
-
-    def close(self) -> None:
-        self._stop_event.set()
-        thread = self._maintenance_thread
-        if thread is not None and thread.is_alive():
-            thread.join(timeout=2.0)
 
     def _count_valid(self, store: Dict[str, CacheEntry] | OrderedDict[str, CacheEntry]) -> int:
         now = self._now_fn()

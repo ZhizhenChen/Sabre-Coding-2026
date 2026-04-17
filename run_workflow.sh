@@ -8,14 +8,14 @@ set -e
 # Default values
 START_DATE="2026-02-07"
 END_DATE="2026-02-07"
-MAX_REQUESTS=3000
+MAX_REQUESTS=100
 OUTPUT_PATH="workflow_ttl_methods_eval_$(date +%Y-%m-%d_%H%M%S).txt"
 CONTROLLED_CAPACITY=100
 UNCONTROLLED_CAPACITY=900
 LRU_CAPACITY=1000
 SCORE_PERCENTILE=0.7
 PREFETCH_RATIO=0.2
-ENABLE_BACKGROUND_REFRESH=false
+
 
 # Parse command line arguments
 while [[ $# -gt 0 ]]; do
@@ -61,10 +61,6 @@ while [[ $# -gt 0 ]]; do
             PREFETCH_RATIO="$2"
             shift 2
             ;;
-        --enable-background-refresh)
-            ENABLE_BACKGROUND_REFRESH=true
-            shift
-            ;;
         --help)
             echo "Usage: ./run_workflow.sh [options]"
             echo ""
@@ -79,7 +75,6 @@ while [[ $# -gt 0 ]]; do
             echo "  --lru-capacity NUM                 LRU baseline capacity (default: 1000)"
             echo "  --score-percentile FLOAT           Score percentile (default: 0.7)"
             echo "  --prefetch-ratio FLOAT             Prefetch ratio (default: 0.2)"
-            echo "  --enable-background-refresh        Enable background refresh flag"
             echo "  --help                             Show this help message"
             echo ""
             echo "Examples:"
@@ -94,9 +89,6 @@ while [[ $# -gt 0 ]]; do
             echo ""
             echo "  # Run with a date range"
             echo "  ./run_workflow.sh --start-date 2026-02-06 --end-date 2026-02-07 --max-requests 3000"
-            echo ""
-            echo "  # Run with background refresh enabled"
-            echo "  ./run_workflow.sh --enable-background-refresh"
             exit 0
             ;;
         *)
@@ -107,21 +99,31 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# Build the Python command
-PYTHON_CMD="python Cache_System_Workflow/cache_pipeline.py"
-PYTHON_CMD="$PYTHON_CMD --start-date $START_DATE"
-PYTHON_CMD="$PYTHON_CMD --end-date $END_DATE"
-PYTHON_CMD="$PYTHON_CMD --max-requests $MAX_REQUESTS"
-PYTHON_CMD="$PYTHON_CMD --output-path $OUTPUT_PATH"
-PYTHON_CMD="$PYTHON_CMD --controlled-capacity $CONTROLLED_CAPACITY"
-PYTHON_CMD="$PYTHON_CMD --uncontrolled-capacity $UNCONTROLLED_CAPACITY"
-PYTHON_CMD="$PYTHON_CMD --lru-capacity $LRU_CAPACITY"
-PYTHON_CMD="$PYTHON_CMD --score-percentile $SCORE_PERCENTILE"
-PYTHON_CMD="$PYTHON_CMD --prefetch-ratio $PREFETCH_RATIO"
-
-if [ "$ENABLE_BACKGROUND_REFRESH" = true ]; then
-    PYTHON_CMD="$PYTHON_CMD --enable-background-refresh"
+# Prefer the project virtualenv interpreter to avoid conda/site-package conflicts.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+VENV_PYTHON="$SCRIPT_DIR/.venv/bin/python"
+if [ -x "$VENV_PYTHON" ]; then
+    PYTHON_BIN="$VENV_PYTHON"
+elif command -v python3 >/dev/null 2>&1; then
+    PYTHON_BIN="python3"
+else
+    PYTHON_BIN="python"
 fi
+
+# Build the Python command as an argument array (safer than eval).
+PYTHON_CMD=(
+    "$PYTHON_BIN" "Cache_System_Workflow/cache_pipeline.py"
+    --start-date "$START_DATE"
+    --end-date "$END_DATE"
+    --max-requests "$MAX_REQUESTS"
+    --output-path "$OUTPUT_PATH"
+    --controlled-capacity "$CONTROLLED_CAPACITY"
+    --uncontrolled-capacity "$UNCONTROLLED_CAPACITY"
+    --lru-capacity "$LRU_CAPACITY"
+    --score-percentile "$SCORE_PERCENTILE"
+    --prefetch-ratio "$PREFETCH_RATIO"
+)
+
 
 # Print configuration
 echo "=========================================="
@@ -136,13 +138,13 @@ echo "Uncontrolled Capacity:    $UNCONTROLLED_CAPACITY"
 echo "LRU Capacity:             $LRU_CAPACITY"
 echo "Score Percentile:         $SCORE_PERCENTILE"
 echo "Prefetch Ratio:           $PREFETCH_RATIO"
-echo "Background Refresh:       $ENABLE_BACKGROUND_REFRESH"
+echo "Python Interpreter:       $PYTHON_BIN"
 echo "=========================================="
 echo ""
 
 # Run the workflow
 echo "Starting workflow execution..."
-eval $PYTHON_CMD
+"${PYTHON_CMD[@]}"
 
 echo ""
 echo "=========================================="

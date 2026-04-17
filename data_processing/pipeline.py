@@ -58,12 +58,6 @@ class DataPipelineProcessor:
         # Step 3: Data cleanup (remove invalid geolocation)
         df = self._cleanup_location_data(df)
 
-        # Step 4: Rate and price processing
-        # df = self._process_rates_and_prices(df)
-
-        # Step 5: Market and price change features
-        # df = self._compute_market_and_price_change(df)
-
         # Step 6: Create source_df (enriched row-level) and produce prepared hourly features
         source_df = df.copy()
         prepared_df = self._create_hourly_features(df)

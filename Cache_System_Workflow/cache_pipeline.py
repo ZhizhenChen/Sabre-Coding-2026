@@ -83,24 +83,52 @@ class LRUSummary:
 
 
 def _build_truth_price_lookup(source_df: pd.DataFrame) -> Dict[str, List[Dict[str, Any]]]:
-    if "price" not in source_df.columns:
-        raise ValueError("source_df must include price_per_day before building truth prices")
-    if "rate_source" not in source_df.columns:
-        raise ValueError("source_df must include rate_source before building truth prices")
-
+    """
+    Build a time-ordered price lookup for each cache_key from unexploded request data.
+    
+    For each cache_key, stores all observed price offers in chronological order.
+    This allows matching served prices against ground truth at the exact request time.
+    
+    Args:
+        source_df: unexploded request data (convertedrate_infos not yet expanded)
+    
+    Returns:
+        Dict mapping cache_key -> List of {timestamp, offers} dicts, sorted by timestamp
+    """
     lookup: Dict[str, List[Dict[str, Any]]] = {}
-
-    df = source_df.dropna(subset=["convertedrate_infos", "cache_key"])
-    for cache_key, group in source_df.dropna(subset=["cache_key", "price", "rate_source"]).groupby("cache_key", dropna=False):
-        # For each cache_key, collect all unique source-price pairs (take minimum price per source)
-        offers = []
-        for source, source_group in group.groupby("rate_source", dropna=False):
-            min_price = float(source_group["price"].min())
-            offers.append({
-                "source": str(source),
-                "price": min_price,
-            })
-        lookup[str(cache_key)] = offers
+    
+    df = source_df.dropna(subset=["cache_key", "rq_timestamp", "convertedrate_infos"]).copy()
+    df["rq_timestamp"] = pd.to_datetime(df["rq_timestamp"], errors="coerce", utc=True)
+    df = df.sort_values(["cache_key", "rq_timestamp"])
+    
+    for cache_key, group in df.groupby("cache_key", dropna=False):
+        time_price_list = []
+        for _, row in group.iterrows():
+            timestamp = row["rq_timestamp"]
+            offers = []
+            
+            # Extract all offers from convertedrate_infos
+            rate_infos = row["convertedrate_infos"]
+            if rate_infos is not None and isinstance(rate_infos, list):
+                for offer in rate_infos:
+                    if isinstance(offer, dict):
+                        price = offer.get("amount_after_tax")
+                        source = offer.get("rate_source", "unknown")
+                        if price is not None:
+                            offers.append({
+                                "source": str(source),
+                                "price": float(price),
+                            })
+            
+            if offers:
+                time_price_list.append({
+                    "timestamp": timestamp,
+                    "offers": offers,
+                })
+        
+        if time_price_list:
+            lookup[str(cache_key)] = time_price_list
+    
     return lookup
 
 
@@ -112,6 +140,47 @@ def _extract_price(payload: Any) -> float | None:
         return float(offers[0].get("price"))
     except Exception:
         return None
+
+
+def _get_truth_price_for_request(
+    cache_key: str,
+    request_timestamp: Any,
+    truth_price_by_key: Dict[str, List[Dict[str, Any]]],
+) -> float | None:
+    """
+    Get ground truth price for a request by matching its cache_key and timestamp.
+    
+    Finds the most recent observation of the cache_key with timestamp <= request_timestamp.
+    
+    Args:
+        cache_key: the request's cache key
+        request_timestamp: the request's timestamp
+        truth_price_by_key: time-ordered price lookup
+    
+    Returns:
+        Minimum price from the matched observation's offers, or None if not found
+    """
+    if cache_key not in truth_price_by_key:
+        return None
+    
+    time_series = truth_price_by_key[cache_key]  # List of {timestamp, offers}
+    request_ts = pd.Timestamp(request_timestamp).to_pydatetime() if not isinstance(request_timestamp, (pd.Timestamp, datetime)) else request_timestamp
+    if hasattr(request_ts, 'replace'):
+        request_ts = request_ts.replace(tzinfo=timezone.utc) if request_ts.tzinfo is None else request_ts
+    
+    closest_idx = None
+    for i, entry in enumerate(time_series):
+        entry_ts = entry["timestamp"]
+        if entry_ts <= request_ts:
+            closest_idx = i
+        else:
+            break
+    
+    if closest_idx is not None:
+        offers = time_series[closest_idx]["offers"]
+        if offers:
+            return float(offers[0].get("price", 0.0))
+    return None
 
 
 def _workflow_cache_keys(workflow: SabreCacheWorkflow) -> set[str]:
@@ -252,7 +321,11 @@ def _build_ttl_lookup(source_df: pd.DataFrame, ttl_method: str) -> Dict[str, int
 
 
 
-def _prepare_requests(requests_df: pd.DataFrame, p_reuse_df: pd.DataFrame) -> List[PreparedWorkflowInput]:
+def _prepare_requests(
+    requests_df: pd.DataFrame,
+    p_reuse_df: pd.DataFrame,
+    ttl_lookup_by_bucket: Dict[str, int],
+) -> List[PreparedWorkflowInput]:
     p_lookup = (
         p_reuse_df.dropna(subset=["cache_key", "p_reuse"])
         .groupby("cache_key", as_index=False)["p_reuse"]
@@ -263,20 +336,23 @@ def _prepare_requests(requests_df: pd.DataFrame, p_reuse_df: pd.DataFrame) -> Li
 
     prepared: List[PreparedWorkflowInput] = []
     for row in merged.itertuples(index=False):
+        request = RequestContext(
+            rq_timestamp=row.rq_timestamp.to_pydatetime() if hasattr(row.rq_timestamp, "to_pydatetime") else row.rq_timestamp,
+            chain_code=str(row.chain_code),
+            stay_start_date=str(pd.Timestamp(row.rq_stay_start_date).strftime("%Y-%m-%d")),
+            stay_end_date=str(pd.Timestamp(row.rq_stay_end_date).strftime("%Y-%m-%d")),
+            duration=int(row.duration),
+            city_code=str(row.location_city_code),
+            lead_time_days=int(row.lead_time),
+            cache_key_value=str(row.cache_key),
+        )
+        # Calculate lambda_i from TTL lookup based on lead time
+        lambda_i = _admission_lambda_for_request(request, ttl_lookup_by_bucket)
         prepared.append(
             PreparedWorkflowInput(
-                request=RequestContext(
-                    rq_timestamp=row.rq_timestamp.to_pydatetime() if hasattr(row.rq_timestamp, "to_pydatetime") else row.rq_timestamp,
-                    chain_code=str(row.chain_code),
-                    stay_start_date=str(pd.Timestamp(row.rq_stay_start_date).strftime("%Y-%m-%d")),
-                    stay_end_date=str(pd.Timestamp(row.rq_stay_end_date).strftime("%Y-%m-%d")),
-                    duration=int(row.duration),
-                    city_code=str(row.location_city_code),
-                    lead_time_days=int(row.lead_time),
-                    cache_key_value=str(row.cache_key),
-                ),
+                request=request,
                 p_reuse=float(row.p_reuse),
-                lambda_i=1.0,  # admission score uses p_reuse only
+                lambda_i=lambda_i,
             )
         )
     return prepared
@@ -293,7 +369,6 @@ def _run_ttl_method(
     uncontrolled_capacity: int = 900,
     score_percentile: float = 0.7,
     prefetch_ratio: float = 0.2,
-    enable_background_refresh: bool = False,
 ) -> EvalSummary:
     provider = TruthPriceProvider(truth_price_by_key)
     workflow = SabreCacheWorkflow(
@@ -301,7 +376,6 @@ def _run_ttl_method(
         uncontrolled_capacity=uncontrolled_capacity,
         score_percentile=score_percentile,
         prefetch_ratio=prefetch_ratio,
-        enable_background_refresh=enable_background_refresh,
         lead_time_breaks=LEAD_TIME_BREAKS,
         lead_time_labels=LEAD_TIME_LABELS,
         km_ttl_lookup_by_bucket=ttl_lookup_by_bucket,
@@ -341,9 +415,8 @@ def _run_ttl_method(
             hit_count += 1
             hit_keys.add(key)
             served_price = _extract_price(result.payload)
-            truth_offers = truth_price_by_key.get(key, [])
-            truth_price = float(truth_offers[0].get("price", 0.0)) if truth_offers else 0.0
-            if served_price is not None and abs(served_price - truth_price) / max(served_price, 1e-6) > 0.01:
+            truth_price = _get_truth_price_for_request(key, request.rq_timestamp, truth_price_by_key)
+            if served_price is not None and truth_price is not None and abs(served_price - truth_price) / max(served_price, 1e-6) > 0.01:
                 stale_response_count += 1
         else:
             miss_count += 1
@@ -375,7 +448,6 @@ def _run_ttl_method(
     api_call_reduction = 1.0 - (provider.calls / lru_provider_calls) if lru_provider_calls else 0.0
     provider_call_counts = workflow.provider_call_counts()
 
-    workflow.close()
     return EvalSummary(
         ttl_method=ttl_method,
         total_requests=total_requests,
@@ -400,8 +472,11 @@ def _run_ttl_method(
     )
 
 
-def _run_lru_baseline(requests_df: pd.DataFrame, lru_capacity: int = 1000) -> LRUSummary:
-    truth_price_by_key = _build_truth_price_lookup(requests_df)
+def _run_lru_baseline(
+    requests_df: pd.DataFrame,
+    truth_price_by_key: Dict[str, List[Dict[str, Any]]],
+    lru_capacity: int = 1000,
+) -> LRUSummary:
     provider = TruthPriceProvider(truth_price_by_key)
     lru = VanillaLRUCache(capacity=lru_capacity)
 
@@ -475,13 +550,12 @@ def run_ttl_method_eval(
     lru_capacity: int = 1000,
     score_percentile: float = 0.7,
     prefetch_ratio: float = 0.2,
-    enable_background_refresh: bool = False,
 ) -> None:
     processor = DataPipelineProcessor(data_root=str(ROOT_DIR / "data" / "cleaned_partitioned"))
 
     source_df, prepared_df = processor.process(start_date=start_date, end_date=end_date, max_requests=max_requests)
 
-    # Build a dedicated frame for price-truth and lambda estimation only.
+    # Build a dedicated frame for lambda estimation only (needs price_change).
     pricing_source_df = processor._process_rates_and_prices(source_df.copy())
     pricing_source_df = processor._compute_market_and_price_change(pricing_source_df)
 
@@ -493,17 +567,22 @@ def run_ttl_method_eval(
         output_parquet=None,
     )
 
-    truth_price_by_key = _build_truth_price_lookup(pricing_source_df)
-    prepared_requests = _prepare_requests(source_df, p_reuse_df)
-    lru_summary = _run_lru_baseline(source_df, lru_capacity=lru_capacity)
+    # Build time-ordered truth price lookup from unexploded source data
+    truth_price_by_key = _build_truth_price_lookup(source_df)
+    lru_summary = _run_lru_baseline(source_df, truth_price_by_key=truth_price_by_key, lru_capacity=lru_capacity)
 
     ttl_methods = ["glm", "pp", "rule_based", "km"]
     evals: List[EvalSummary] = []
     ttl_lookups: Dict[str, Dict[str, int]] = {}
-
+    lines: List[str] = []
     for method in ttl_methods:
         ttl_lookup = _build_ttl_lookup(pricing_source_df, ttl_method=method)
         ttl_lookups[method] = ttl_lookup
+        # Prepare requests with lambda_i from this TTL method
+        prepared_requests = _prepare_requests(source_df, p_reuse_df, ttl_lookup)
+        # lines.append(method.upper() + " TTL Lookup:")
+        # for i in prepared_requests:
+        #     lines.append(f"Prepared request: cache_key={i.request.cache_key()}, rq_timestamp = {i.request.rq_timestamp}, p_reuse={i.p_reuse:.4f}, lambda_i={i.lambda_i:.6f}")
         evals.append(
             _run_ttl_method(
                 ttl_method=method,
@@ -516,11 +595,10 @@ def run_ttl_method_eval(
                 uncontrolled_capacity=uncontrolled_capacity,
                 score_percentile=score_percentile,
                 prefetch_ratio=prefetch_ratio,
-                enable_background_refresh=enable_background_refresh,
             )
         )
 
-    lines: List[str] = []
+    # lines: List[str] = []
     lines.append("TTL METHOD EVAL (admission score uses TTL-implied lambda)")
 
     lines.append(f"start_date={start_date}")
@@ -536,6 +614,8 @@ def run_ttl_method_eval(
     lines.append("=== LRU Baseline ===")
     lines.append(f"requests_total: {lru_summary.total_requests}")
     lines.append(f"hit_rate: {lru_summary.hit_rate:.4f}")
+    lines.append(f"hit_count: {lru_summary.hit_count}")
+    lines.append(f"miss_count: {lru_summary.miss_count}")
     lines.append(f"provider_total_calls: {lru_summary.provider_calls}")
     lines.append("")
 
@@ -543,6 +623,9 @@ def run_ttl_method_eval(
         lines.append(f"=== TTL Method: {summary.ttl_method} ===")
         lines.append(f"requests_total: {summary.total_requests}")
         lines.append(f"hit_rate: {summary.hit_rate:.4f}")
+        lines.append(f"hit_rate_improvement_pct_vs_lru: {(summary.hit_rate - lru_summary.hit_rate) / summary.hit_rate * 100.0 if summary.hit_rate else 0.0:.2f}")
+        lines.append(f"hit_count: {summary.hit_count}")
+        lines.append(f"miss_count: {summary.miss_count}")
         lines.append(f"provider_total_calls: {summary.provider_calls}")
         lines.append(f"provider_refresh_calls: {summary.provider_refresh_calls}")
         lines.append(f"provider_prefetch_calls: {summary.provider_prefetch_calls}")
@@ -577,8 +660,7 @@ if __name__ == "__main__":
     parser.add_argument("--lru-capacity", type=int, default=1000, help="LRU baseline capacity (default: 1000)")
     parser.add_argument("--score-percentile", type=float, default=0.7, help="Score percentile (default: 0.7)")
     parser.add_argument("--prefetch-ratio", type=float, default=0.2, help="Prefetch ratio (default: 0.2)")
-    parser.add_argument("--enable-background-refresh", action="store_true", help="Enable background refresh")
-    
+   
     args = parser.parse_args()
     
     run_ttl_method_eval(
@@ -591,5 +673,4 @@ if __name__ == "__main__":
         lru_capacity=args.lru_capacity,
         score_percentile=args.score_percentile,
         prefetch_ratio=args.prefetch_ratio,
-        enable_background_refresh=args.enable_background_refresh,
     )
