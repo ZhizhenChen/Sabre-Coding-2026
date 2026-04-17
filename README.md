@@ -4,7 +4,7 @@ This repository runs end-to-end cache policy experiments for hotel pricing reque
 
 Main objectives:
 - generate demand reuse score (`p_reuse`)
-- optionally build MIDAS admission score (`midas_score`)
+- optionally build MIDAS-v2 admission score (`midas_score`) using latent behavior states + Markov smoothing
 - estimate TTL by multiple methods (`glm`, `pp`, `rule_based`, `km`)
 - evaluate two-tier cache workflow vs LRU baseline
 - report hit rate, provider calls, staleness, prewarm quality, and eviction behavior
@@ -17,11 +17,13 @@ Current setup in this script:
 - admission score source is configurable: `p_reuse` or `midas`
 - TTL method is varied across `glm`, `pp`, `rule_based`, `km`
 - workflow engine is [Cache_System_Workflow/sabre_cache_workflow_v2.py](Cache_System_Workflow/sabre_cache_workflow_v2.py)
+- MIDAS module is [midas/midas_score.py](midas/midas_score.py)
 
 ## Repository Structure
 
 - [data_processing/pipeline.py](data_processing/pipeline.py): data preprocessing and feature engineering
 - [demand_forecasting/model_input.py](demand_forecasting/model_input.py): demand scoring (`p_reuse`)
+- [midas/midas_score.py](midas/midas_score.py): latent behavior intent scoring + MIDAS-v2 correction
 - [Lambda/lambda_model.py](Lambda/lambda_model.py): lambda/KM/GLM estimation utilities
 - [Cache_System_Workflow/cache_pipeline.py](Cache_System_Workflow/cache_pipeline.py): TTL method evaluation driver
 - [Cache_System_Workflow/sabre_cache_workflow_v2.py](Cache_System_Workflow/sabre_cache_workflow_v2.py): two-tier cache implementation
@@ -35,9 +37,10 @@ Current setup in this script:
    - `source_df`: enriched row-level frame (includes exploded rate/source rows)
    - `prepared_df`: hourly feature frame for demand model
 3. Generate `p_reuse` from `prepared_df` and `source_df`.
-4. Build request records (`PreparedWorkflowInput`) for cache simulation.
-5. Run cache workflow and LRU baseline.
-6. Write text report.
+4. Optionally build `midas_score` from latent behavior-state Markov model.
+5. Build request records (`PreparedWorkflowInput`) for cache simulation.
+6. Run cache workflow and LRU baseline.
+7. Write text report.
 
 ## Payload Format (Current)
 
@@ -87,6 +90,12 @@ If XGBoost on macOS raises OpenMP errors:
 brew install libomp
 ```
 
+If using demand checkpoints in `demand_forecasting/checkpoint_model_*`, install:
+
+```bash
+pip install gluonts[torch]
+```
+
 ## Run
 
 From repo root, run the main evaluator:
@@ -104,6 +113,12 @@ python Cache_System_Workflow/cache_pipeline.py \
   --output-path workflow_ttl_methods_eval_custom.txt \
   --controlled-capacity 100 \
   --uncontrolled-capacity 900 \
+  --admission-source midas \
+  --w-demand 0.85 \
+  --w-intent 0.15 \
+  --midas-eta 0.35 \
+  --midas-tau 0.08 \
+  --midas-alpha 1.0 \
   --score-percentile 0.7 \
   --prefetch-ratio 0.2
 ```

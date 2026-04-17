@@ -30,6 +30,7 @@ from Cache_System_Workflow.sabre_cache_workflow_v2 import TruthPriceProvider, Pr
 from demand_forecasting.model_input import DemandScoreGenerator
 from LRU.simulate_lru_baseline import VanillaLRUCache
 from data_processing.pipeline import DataPipelineProcessor
+from midas.midas_score import build_midas_scores
 
 lambda_model = importlib.import_module("lambda_model")
 build_lambda_table = lambda_model.build_lambda_table
@@ -350,16 +351,21 @@ def _request_context_from_row(row: Any) -> RequestContext:
 
 def _prepare_requests(
     requests_df: pd.DataFrame,
-    p_reuse_df: pd.DataFrame,
+    score_df: pd.DataFrame,
     ttl_lookup_by_bucket: Dict[str, int],
+    score_col: str = "p_reuse",
 ) -> List[PreparedWorkflowInput]:
+    if score_col not in score_df.columns:
+        raise ValueError(f"score_df must include score column '{score_col}'.")
+
     p_lookup = (
-        p_reuse_df.dropna(subset=["cache_key", "p_reuse"])
-        .groupby("cache_key", as_index=False)["p_reuse"]
+        score_df.dropna(subset=["cache_key", score_col])
+        .groupby("cache_key", as_index=False)[score_col]
         .mean()
     )
+    p_lookup = p_lookup.rename(columns={score_col: "admission_score"})
     merged = requests_df.merge(p_lookup, on=["cache_key"], how="left")
-    merged["p_reuse"] = merged["p_reuse"].fillna(0.5)
+    merged["admission_score"] = merged["admission_score"].fillna(0.5)
 
     prepared: List[PreparedWorkflowInput] = []
     for row in merged.itertuples(index=False):
@@ -369,7 +375,7 @@ def _prepare_requests(
         prepared.append(
             PreparedWorkflowInput(
                 request=request,
-                p_reuse=float(row.p_reuse),
+                p_reuse=float(row.admission_score),
                 lambda_i=lambda_i,
             )
         )
@@ -535,6 +541,34 @@ def _run_lru_baseline(
     )
 
 
+def _build_admission_scores(
+    source_df: pd.DataFrame,
+    p_reuse_df: pd.DataFrame,
+    admission_source: str,
+    *,
+    w_demand: float,
+    w_intent: float,
+    eta: float,
+    tau: float,
+    alpha: float,
+) -> tuple[pd.DataFrame, str]:
+    source = admission_source.strip().lower()
+    if source == "p_reuse":
+        return p_reuse_df.copy(), "p_reuse"
+    if source == "midas":
+        midas_df = build_midas_scores(
+            requests_df=source_df,
+            p_reuse_df=p_reuse_df,
+            w_demand=w_demand,
+            w_intent=w_intent,
+            eta=eta,
+            tau=tau,
+            alpha=alpha,
+        )
+        return midas_df, "midas_score"
+    raise ValueError("admission_source must be one of: p_reuse, midas")
+
+
 def run_ttl_method_eval(
     start_date: str | None = None,
     end_date: str | None = None,
@@ -545,6 +579,12 @@ def run_ttl_method_eval(
     lru_capacity: int = 1000,
     score_percentile: float = 0.7,
     prefetch_ratio: float = 0.2,
+    admission_source: str = "midas",
+    w_demand: float = 0.85,
+    w_intent: float = 0.15,
+    midas_eta: float = 0.35,
+    midas_tau: float = 0.08,
+    midas_alpha: float = 1.0,
 ) -> None:
     processor = DataPipelineProcessor(data_root=str(ROOT_DIR / "data" / "cleaned_partitioned"))
 
@@ -566,6 +606,21 @@ def run_ttl_method_eval(
     )
     print(f"Generated demand scores: p_reuse_df={len(p_reuse_df)} rows")
 
+    admission_scores_df, admission_score_col = _build_admission_scores(
+        source_df=source_df,
+        p_reuse_df=p_reuse_df,
+        admission_source=admission_source,
+        w_demand=w_demand,
+        w_intent=w_intent,
+        eta=midas_eta,
+        tau=midas_tau,
+        alpha=midas_alpha,
+    )
+    print(
+        f"Built admission scores: source={admission_source}, "
+        f"rows={len(admission_scores_df)}, score_col={admission_score_col}"
+    )
+
     # Build time-ordered truth price lookup from unexploded source data
     truth_price_by_key = _build_truth_price_lookup(source_df)
     print(f"Built truth price lookup for {len(truth_price_by_key)} unique cache keys")
@@ -582,7 +637,12 @@ def run_ttl_method_eval(
         ttl_lookup = _build_ttl_lookup(pricing_source_df, ttl_method=method)
         ttl_lookups[method] = ttl_lookup
         # Prepare requests with lambda_i from this TTL method
-        prepared_requests = _prepare_requests(source_df, p_reuse_df, ttl_lookup)
+        prepared_requests = _prepare_requests(
+            source_df,
+            admission_scores_df,
+            ttl_lookup,
+            score_col=admission_score_col,
+        )
         print(f"Prepared requests for {method.upper()}: {len(prepared_requests)}")
         # lines.append(method.upper() + " TTL Lookup:")
         # for i in prepared_requests:
@@ -605,7 +665,7 @@ def run_ttl_method_eval(
     
     
     # lines: List[str] = []
-    lines.append("TTL METHOD EVAL (admission score uses TTL-implied lambda)")
+    lines.append("TTL METHOD EVAL (admission score + TTL-implied lambda)")
 
     lines.append(f"start_date={start_date}")
     lines.append(f"end_date={end_date}")
@@ -615,6 +675,13 @@ def run_ttl_method_eval(
     lines.append(f"source_rows_after_explode={len(pricing_source_df)}")
     lines.append(f"prepared_feature_rows={len(prepared_df)}")
     lines.append(f"p_reuse_rows={len(p_reuse_df)}")
+    lines.append(f"admission_source={admission_source}")
+    lines.append(f"admission_score_col={admission_score_col}")
+    lines.append(f"w_demand={w_demand}")
+    lines.append(f"w_intent={w_intent}")
+    lines.append(f"midas_eta={midas_eta}")
+    lines.append(f"midas_tau={midas_tau}")
+    lines.append(f"midas_alpha={midas_alpha}")
     lines.append("")
 
     lines.append("=== LRU Baseline ===")
@@ -629,7 +696,11 @@ def run_ttl_method_eval(
         lines.append(f"=== TTL Method: {summary.ttl_method} ===")
         lines.append(f"requests_total: {summary.total_requests}")
         lines.append(f"hit_rate: {summary.hit_rate:.4f}")
-        lines.append(f"hit_rate_improvement_pct_vs_lru: {(summary.hit_rate - lru_summary.hit_rate) / summary.hit_rate * 100.0 if summary.hit_rate else 0.0:.2f}")
+        if lru_summary.hit_rate > 0:
+            hit_rate_improvement = ((summary.hit_rate - lru_summary.hit_rate) / lru_summary.hit_rate) * 100.0
+        else:
+            hit_rate_improvement = 0.0
+        lines.append(f"hit_rate_improvement_pct_vs_lru: {hit_rate_improvement:.2f}")
         lines.append(f"hit_count: {summary.hit_count}")
         lines.append(f"miss_count: {summary.miss_count}")
         lines.append(f"provider_total_calls: {summary.provider_calls}")
@@ -659,16 +730,22 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="TTL Method Evaluation with configurable cache parameters")
     parser.add_argument("--start-date", default=None, help="Optional start date (YYYY-MM-DD)")
     parser.add_argument("--end-date", default=None, help="Optional end date (YYYY-MM-DD)")
-    parser.add_argument("--max-requests", type=int, default=10000000, help="Max requests to sample (default: 10000000)")
+    parser.add_argument("--max-requests", type=int, default=100000000, help="Max requests to sample (default: 100000000)")
     parser.add_argument("--output-path", default="workflow_ttl_methods_eval_2026-02-07_all.txt", help="Output file path")
-    parser.add_argument("--controlled-capacity", type=int, default=100, help="Controlled cache capacity (default: 100)")
-    parser.add_argument("--uncontrolled-capacity", type=int, default=900, help="Uncontrolled cache capacity (default: 900)")
-    parser.add_argument("--lru-capacity", type=int, default=1000, help="LRU baseline capacity (default: 1000)")
+    parser.add_argument("--controlled-capacity", type=int, default=20000, help="Controlled cache capacity (default: 20000)")
+    parser.add_argument("--uncontrolled-capacity", type=int, default=180000, help="Uncontrolled cache capacity (default: 180000)")
+    parser.add_argument("--lru-capacity", type=int, default=200000, help="LRU baseline capacity (default: 200000)")
     parser.add_argument("--score-percentile", type=float, default=0.7, help="Score percentile (default: 0.7)")
     parser.add_argument("--prefetch-ratio", type=float, default=0.2, help="Prefetch ratio (default: 0.2)")
-   
+    parser.add_argument("--admission-source", choices=["p_reuse", "midas"], default="midas", help="Admission score source")
+    parser.add_argument("--w-demand", type=float, default=0.85, help="Demand weight for MIDAS blend")
+    parser.add_argument("--w-intent", type=float, default=0.15, help="Intent weight for MIDAS blend")
+    parser.add_argument("--midas-eta", type=float, default=0.35, help="Markov smoothing blend exponent")
+    parser.add_argument("--midas-tau", type=float, default=0.08, help="Bound for MIDAS correction delta")
+    parser.add_argument("--midas-alpha", type=float, default=1.0, help="Dirichlet smoothing for transition matrix")
+
     args = parser.parse_args()
-    
+
     run_ttl_method_eval(
         start_date=args.start_date,
         end_date=args.end_date,
@@ -679,4 +756,10 @@ if __name__ == "__main__":
         lru_capacity=args.lru_capacity,
         score_percentile=args.score_percentile,
         prefetch_ratio=args.prefetch_ratio,
+        admission_source=args.admission_source,
+        w_demand=args.w_demand,
+        w_intent=args.w_intent,
+        midas_eta=args.midas_eta,
+        midas_tau=args.midas_tau,
+        midas_alpha=args.midas_alpha,
     )

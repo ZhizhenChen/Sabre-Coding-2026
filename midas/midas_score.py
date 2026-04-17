@@ -1,151 +1,269 @@
 from __future__ import annotations
 
+import json
+from dataclasses import dataclass
 from typing import Optional
 
 import numpy as np
 import pandas as pd
 
+STATES = [
+    "urgent_repeat",
+    "planned_repeat",
+    "planned_explore",
+    "price_probe",
+    "cold_start",
+]
+STATE_TO_IDX = {state: i for i, state in enumerate(STATES)}
+K_STATES = len(STATES)
 
-LEAD_TIME_BREAKS = [1, 3, 7, 30]
-LEAD_TIME_LABELS = ["same_day", "short", "mid", "long", "very_long"]
+# Higher value means stronger expected short-horizon reuse likelihood.
+STATE_REUSE_WEIGHTS = np.array([1.00, 0.85, 0.45, 0.30, 0.20], dtype=float)
 
 
-def _assign_lead_time_bucket(lead_time_days: int) -> str:
-    for boundary, label in zip(LEAD_TIME_BREAKS, LEAD_TIME_LABELS[:-1]):
-        if lead_time_days <= boundary:
-            return label
-    return LEAD_TIME_LABELS[-1]
+@dataclass(frozen=True)
+class MidasParams:
+    w_demand: float = 0.85
+    w_intent: float = 0.15
+    eta: float = 0.35
+    tau: float = 0.08
+    alpha: float = 1.0
+    eps: float = 1e-4
 
 
 def _resolve_user_series(frame: pd.DataFrame) -> pd.Series:
-    if "rq_user" in frame.columns:
-        return frame["rq_user"].astype(str).replace({"": "anonymous", "nan": "anonymous"}).fillna("anonymous")
-    if "rq_correlation_id" in frame.columns:
-        return frame["rq_correlation_id"].astype(str).replace({"": "anonymous", "nan": "anonymous"}).fillna("anonymous")
+    for col in ["rq_user", "rq_correlation_id", "session_id", "user_id"]:
+        if col in frame.columns:
+            return frame[col].astype(str).replace({"": "anonymous", "nan": "anonymous"}).fillna("anonymous")
     return pd.Series(["anonymous"] * len(frame), index=frame.index, dtype="object")
 
 
-def _resolve_state(frame: pd.DataFrame, state_col: Optional[str] = None) -> pd.Series:
-    if state_col and state_col in frame.columns:
-        return frame[state_col].astype(str).replace({"": "unknown", "nan": "unknown"}).fillna("unknown")
-
-    if "lead_time_bucket" in frame.columns:
-        lead_bucket = frame["lead_time_bucket"].astype(str)
-    else:
-        lead = pd.to_numeric(frame.get("lead_time", 0), errors="coerce").fillna(0).clip(lower=0).astype(int)
-        lead_bucket = lead.apply(_assign_lead_time_bucket)
-
-    hotel_grouped = None
-    for candidate in ["hotel_grouped", "hotel_code", "chain_code"]:
-        if candidate in frame.columns:
-            hotel_grouped = frame[candidate].astype(str)
-            break
-    if hotel_grouped is None:
-        hotel_grouped = pd.Series(["unknown"] * len(frame), index=frame.index, dtype="object")
-
-    rate_source = frame.get("rate_source")
-    if rate_source is None:
-        rate_source = pd.Series(["unknown"] * len(frame), index=frame.index, dtype="object")
-    rate_source = rate_source.astype(str)
-
-    return (hotel_grouped + "|" + rate_source + "|" + lead_bucket).replace({"": "unknown", "nan": "unknown"}).fillna("unknown")
+def _resolve_hotel_series(frame: pd.DataFrame) -> pd.Series:
+    for col in ["hotel_code", "hotel_grouped", "chain_code"]:
+        if col in frame.columns:
+            return frame[col].astype(str).replace({"": "unknown_hotel", "nan": "unknown_hotel"}).fillna("unknown_hotel")
+    return pd.Series(["unknown_hotel"] * len(frame), index=frame.index, dtype="object")
 
 
-def _markov_event_scores(events: pd.DataFrame, alpha: float = 1.0) -> pd.DataFrame:
-    if events.empty:
-        return pd.DataFrame(columns=["cache_key", "markov_state_score"])
+def _resolve_lead_time(frame: pd.DataFrame) -> pd.Series:
+    if "lead_time" in frame.columns:
+        return pd.to_numeric(frame["lead_time"], errors="coerce").fillna(0).clip(lower=0)
+    return pd.Series([0.0] * len(frame), index=frame.index)
 
-    alpha = float(max(alpha, 1e-6))
-    states = sorted(events["state"].dropna().astype(str).unique().tolist())
-    n_states = max(1, len(states))
 
-    prior_counts = events["state"].value_counts().to_dict()
-    prior_total = float(sum(prior_counts.values()))
-    prior_prob = {s: (float(prior_counts.get(s, 0.0)) + alpha) / (prior_total + alpha * n_states) for s in states}
-
-    pair_counts: dict[tuple[str, str], int] = {}
-    prev_out_counts: dict[str, int] = {}
-    for _, g in events.groupby("user_id", dropna=False):
-        seq = g["state"].astype(str).tolist()
-        for i in range(1, len(seq)):
-            prev_s, cur_s = seq[i - 1], seq[i]
-            pair_counts[(prev_s, cur_s)] = pair_counts.get((prev_s, cur_s), 0) + 1
-            prev_out_counts[prev_s] = prev_out_counts.get(prev_s, 0) + 1
-
-    rows = []
-    for _, g in events.groupby("user_id", dropna=False):
-        g = g.sort_values("rq_timestamp")
-        prev_state = None
-        for rec in g.itertuples(index=False):
-            cur_state = str(rec.state)
-            if prev_state is None:
-                sc = float(prior_prob.get(cur_state, 1.0 / n_states))
-            else:
-                num = float(pair_counts.get((prev_state, cur_state), 0)) + alpha
-                den = float(prev_out_counts.get(prev_state, 0)) + alpha * n_states
-                sc = num / den if den > 0 else (1.0 / n_states)
-            rows.append(
-                {
-                    "cache_key": str(rec.cache_key),
-                    "markov_event_score": float(np.clip(sc, 0.0, 1.0)),
-                }
-            )
-            prev_state = cur_state
-
-    scored = pd.DataFrame(rows)
-    out = scored.groupby("cache_key", dropna=False)["markov_event_score"].mean().reset_index(name="markov_state_score")
+def _compute_user_cumulative_unique_hotels(events: pd.DataFrame) -> np.ndarray:
+    out = np.zeros(len(events), dtype=float)
+    for _, idx in events.groupby("user_id", sort=False).groups.items():
+        seen: set[str] = set()
+        for pos in idx:
+            seen.add(str(events.at[pos, "hotel_id"]))
+            out[pos] = float(len(seen))
     return out
+
+
+def _softmax_rows(x: np.ndarray) -> np.ndarray:
+    x = x - x.max(axis=1, keepdims=True)
+    e = np.exp(x)
+    return e / np.clip(e.sum(axis=1, keepdims=True), 1e-12, None)
+
+
+def _build_weak_state_probs(events: pd.DataFrame) -> np.ndarray:
+    lead = events["lead_time"].to_numpy(dtype=float)
+    repeat_seen = (events["user_hotel_seen"] > 0).to_numpy(dtype=float)
+    cold = (events["user_event_index"] <= 1).to_numpy(dtype=float)
+    heavy_same_day = (events["user_day_queries"] >= 4).to_numpy(dtype=float)
+    high_explore = (
+        (events["user_cum_unique_hotels"] >= 4)
+        & ((events["user_cum_unique_hotels"] / np.maximum(events["user_event_index"] + 1, 1)) >= 0.55)
+    ).to_numpy(dtype=float)
+
+    logits = np.zeros((len(events), K_STATES), dtype=float)
+
+    # urgent_repeat
+    logits[:, STATE_TO_IDX["urgent_repeat"]] = 2.0 * (lead <= 3) + 1.2 * repeat_seen + 0.4 * heavy_same_day
+    # planned_repeat
+    logits[:, STATE_TO_IDX["planned_repeat"]] = 1.8 * ((lead > 3) & (lead <= 30)) + 1.5 * repeat_seen
+    # planned_explore
+    logits[:, STATE_TO_IDX["planned_explore"]] = 1.4 * (1.0 - repeat_seen) + 1.4 * high_explore
+    # price_probe
+    logits[:, STATE_TO_IDX["price_probe"]] = 1.5 * heavy_same_day + 0.8 * (lead <= 15) + 0.6 * (1.0 - repeat_seen)
+    # cold_start
+    logits[:, STATE_TO_IDX["cold_start"]] = 2.2 * cold + 0.8 * (events["user_total_events"].to_numpy(dtype=float) <= 2)
+
+    return _softmax_rows(logits)
+
+
+def _estimate_transition_matrix(events: pd.DataFrame, q_weak: np.ndarray, alpha: float) -> np.ndarray:
+    trans = np.full((K_STATES, K_STATES), float(max(alpha, 1e-6)), dtype=float)
+
+    for _, idx in events.groupby("user_id", sort=False).groups.items():
+        if len(idx) <= 1:
+            continue
+        seq_idx = list(idx)
+        for p, c in zip(seq_idx[:-1], seq_idx[1:]):
+            trans += np.outer(q_weak[p], q_weak[c])
+
+    row_sums = np.clip(trans.sum(axis=1, keepdims=True), 1e-12, None)
+    return trans / row_sums
+
+
+def _markov_smooth(events: pd.DataFrame, q_weak: np.ndarray, eta: float, alpha: float) -> np.ndarray:
+    eta = float(np.clip(eta, 0.0, 1.0))
+    prior = np.clip(q_weak.mean(axis=0), 1e-9, None)
+    prior = prior / prior.sum()
+
+    A = _estimate_transition_matrix(events, q_weak, alpha=alpha)
+    q_final = np.zeros_like(q_weak)
+
+    for _, idx in events.groupby("user_id", sort=False).groups.items():
+        seq_idx = list(idx)
+        if not seq_idx:
+            continue
+        prev = prior
+        for pos in seq_idx:
+            pi = prev @ A
+            fused = (np.clip(pi, 1e-9, None) ** eta) * (np.clip(q_weak[pos], 1e-9, None) ** (1.0 - eta))
+            fused = fused / np.clip(fused.sum(), 1e-12, None)
+            q_final[pos] = fused
+            prev = fused
+
+    return q_final
 
 
 def build_midas_scores(
     requests_df: pd.DataFrame,
     p_reuse_df: pd.DataFrame,
-    w_demand: float = 0.8,
-    w_markov: float = 0.2,
+    *,
+    w_demand: float = 0.85,
+    w_intent: float = 0.15,
+    eta: float = 0.35,
+    tau: float = 0.08,
     alpha: float = 1.0,
-    state_col: Optional[str] = None,
+    eps: float = 1e-4,
 ) -> pd.DataFrame:
-    """Build key-level MIDAS score = demand score + Markov state uplift.
+    """
+    Build MIDAS score using latent behavior-state inference + Markov smoothing.
 
-    Returns columns: cache_key, p_reuse, markov_state_score, midas_score, midas_version.
+    Output columns:
+    - cache_key
+    - p_reuse
+    - intent_score
+    - markov_score
+    - state_top
+    - state_probs_json
+    - state_confidence
+    - state_entropy
+    - midas_delta
+    - midas_score
+    - midas_version
     """
     if "cache_key" not in requests_df.columns:
-        raise ValueError("requests_df must contain 'cache_key'")
+        raise ValueError("requests_df must contain 'cache_key'.")
+    if "rq_timestamp" not in requests_df.columns:
+        raise ValueError("requests_df must contain 'rq_timestamp'.")
+    if not {"cache_key", "p_reuse"}.issubset(set(p_reuse_df.columns)):
+        raise ValueError("p_reuse_df must contain ['cache_key', 'p_reuse'].")
 
-    p_cols = {"cache_key", "p_reuse"}
-    if not p_cols.issubset(set(p_reuse_df.columns)):
-        raise ValueError("p_reuse_df must contain 'cache_key' and 'p_reuse'")
+    params = MidasParams(
+        w_demand=float(max(w_demand, 0.0)),
+        w_intent=float(max(w_intent, 0.0)),
+        eta=float(np.clip(eta, 0.0, 1.0)),
+        tau=float(max(tau, 0.0)),
+        alpha=float(max(alpha, 1e-6)),
+        eps=float(np.clip(eps, 1e-9, 1e-2)),
+    )
 
-    base = p_reuse_df[["cache_key", "p_reuse"]].copy()
-    base["cache_key"] = base["cache_key"].astype(str)
-    base["p_reuse"] = pd.to_numeric(base["p_reuse"], errors="coerce")
-    base = base.groupby("cache_key", as_index=False)["p_reuse"].mean()
+    # Normalize demand-side key score.
+    p_reuse_base = (
+        p_reuse_df[["cache_key", "p_reuse"]]
+        .copy()
+        .assign(cache_key=lambda x: x["cache_key"].astype(str))
+        .assign(p_reuse=lambda x: pd.to_numeric(x["p_reuse"], errors="coerce"))
+        .groupby("cache_key", as_index=False)["p_reuse"]
+        .mean()
+    )
 
     events = requests_df.copy()
-    if "rq_timestamp" not in events.columns:
-        raise ValueError("requests_df must contain 'rq_timestamp'")
     events["rq_timestamp"] = pd.to_datetime(events["rq_timestamp"], errors="coerce", utc=True)
     events = events.dropna(subset=["rq_timestamp", "cache_key"]).copy()
-
     events["cache_key"] = events["cache_key"].astype(str)
+
     events["user_id"] = _resolve_user_series(events)
-    events["state"] = _resolve_state(events, state_col=state_col)
+    events["hotel_id"] = _resolve_hotel_series(events)
+    events["lead_time"] = _resolve_lead_time(events)
+    events["rq_date"] = events["rq_timestamp"].dt.date.astype(str)
+
     events = events.sort_values(["user_id", "rq_timestamp"], kind="stable").reset_index(drop=True)
 
-    markov = _markov_event_scores(events, alpha=alpha)
+    events["user_event_index"] = events.groupby("user_id", sort=False).cumcount()
+    events["user_hotel_seen"] = events.groupby(["user_id", "hotel_id"], sort=False).cumcount()
+    events["user_day_queries"] = events.groupby(["user_id", "rq_date"], sort=False)["cache_key"].transform("size")
+    events["user_total_events"] = events.groupby("user_id", sort=False)["cache_key"].transform("size")
+    events["user_cum_unique_hotels"] = _compute_user_cumulative_unique_hotels(events)
 
-    out = base.merge(markov, on="cache_key", how="left")
-    global_markov = float(markov["markov_state_score"].mean()) if not markov.empty else 0.5
-    out["markov_state_score"] = pd.to_numeric(out["markov_state_score"], errors="coerce").fillna(global_markov).clip(0.0, 1.0)
+    q_weak = _build_weak_state_probs(events)
+    q_final = _markov_smooth(events, q_weak, eta=params.eta, alpha=params.alpha)
+
+    markov_score = (q_final @ STATE_REUSE_WEIGHTS).astype(float)
+    state_idx = np.argmax(q_final, axis=1)
+    state_top = [STATES[i] for i in state_idx]
+    state_conf = q_final.max(axis=1)
+    state_entropy = -(q_final * np.log(np.clip(q_final, 1e-12, None))).sum(axis=1)
+
+    per_event = events[["cache_key"]].copy()
+    per_event["markov_score"] = markov_score
+    per_event["state_top"] = state_top
+    per_event["state_confidence"] = state_conf
+    per_event["state_entropy"] = state_entropy
+    per_event["state_probs_json"] = [
+        json.dumps({k: float(v) for k, v in zip(STATES, row)}, separators=(",", ":"))
+        for row in q_final
+    ]
+
+    key_intent = (
+        per_event.groupby("cache_key", as_index=False)
+        .agg(
+            markov_score=("markov_score", "mean"),
+            state_confidence=("state_confidence", "mean"),
+            state_entropy=("state_entropy", "mean"),
+            state_top=("state_top", lambda s: s.value_counts().index[0] if len(s) else "cold_start"),
+            state_probs_json=("state_probs_json", "last"),
+        )
+    )
+
+    out = p_reuse_base.merge(key_intent, on="cache_key", how="left")
     out["p_reuse"] = pd.to_numeric(out["p_reuse"], errors="coerce").fillna(0.5).clip(0.0, 1.0)
+    out["markov_score"] = pd.to_numeric(out["markov_score"], errors="coerce").fillna(0.5).clip(0.0, 1.0)
+    out["state_confidence"] = pd.to_numeric(out["state_confidence"], errors="coerce").fillna(1.0 / K_STATES).clip(0.0, 1.0)
+    out["state_entropy"] = pd.to_numeric(out["state_entropy"], errors="coerce").fillna(float(np.log(K_STATES)))
+    out["state_top"] = out["state_top"].fillna("cold_start").astype(str)
+    out["state_probs_json"] = out["state_probs_json"].fillna("{}")
 
-    wd = max(0.0, float(w_demand))
-    wm = max(0.0, float(w_markov))
-    if wd + wm <= 0:
-        wd, wm = 0.8, 0.2
-    z = wd + wm
-    wd, wm = wd / z, wm / z
+    w_sum = params.w_demand + params.w_intent
+    if w_sum <= 0:
+        w_d, w_i = 0.85, 0.15
+    else:
+        w_d, w_i = params.w_demand / w_sum, params.w_intent / w_sum
 
-    out["midas_score"] = (wd * out["p_reuse"] + wm * out["markov_state_score"]).clip(0.0, 1.0)
-    out["midas_version"] = "MIDAS_v1"
-    return out[["cache_key", "p_reuse", "markov_state_score", "midas_score", "midas_version"]]
+    out["intent_score"] = (w_d * out["p_reuse"] + w_i * out["markov_score"]).clip(0.0, 1.0)
+
+    centered = 1.6 * (out["intent_score"] - 0.5) + 0.7 * (out["state_confidence"] - (1.0 / K_STATES))
+    out["midas_delta"] = params.tau * np.tanh(centered)
+    out["midas_score"] = (out["p_reuse"] + out["midas_delta"]).clip(params.eps, 1.0 - params.eps)
+    out["midas_version"] = "MIDAS_v2_latent_markov"
+
+    return out[
+        [
+            "cache_key",
+            "p_reuse",
+            "intent_score",
+            "markov_score",
+            "state_top",
+            "state_probs_json",
+            "state_confidence",
+            "state_entropy",
+            "midas_delta",
+            "midas_score",
+            "midas_version",
+        ]
+    ]

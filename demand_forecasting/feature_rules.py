@@ -4,9 +4,16 @@ import pandas as pd
 
 
 def build_geo_grid_series(lat: pd.Series, lon: pd.Series, precision: int = 2) -> pd.Series:
-    lat_num = pd.to_numeric(lat, errors="coerce").round(precision).astype(str)
-    lon_num = pd.to_numeric(lon, errors="coerce").round(precision).astype(str)
-    return ("Grid_" + lat_num + "_" + lon_num).fillna("Missing_Grid")
+    lat_num = pd.to_numeric(lat, errors="coerce").round(precision)
+    lon_num = pd.to_numeric(lon, errors="coerce").round(precision)
+
+    lat_str = lat_num.astype("string").fillna("NA")
+    lon_str = lon_num.astype("string").fillna("NA")
+    grid = ("Grid_" + lat_str + "_" + lon_str).astype("string")
+
+    missing_mask = lat_num.isna() | lon_num.isna()
+    grid = grid.where(~missing_mask, "Missing_Grid")
+    return grid.astype(str)
 
 
 def assign_geo_grid(

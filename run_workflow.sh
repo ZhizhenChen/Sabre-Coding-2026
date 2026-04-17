@@ -15,6 +15,12 @@ UNCONTROLLED_CAPACITY=180000
 LRU_CAPACITY=200000
 SCORE_PERCENTILE=0.7
 PREFETCH_RATIO=0.2
+ADMISSION_SOURCE="midas"
+W_DEMAND=0.85
+W_INTENT=0.15
+MIDAS_ETA=0.35
+MIDAS_TAU=0.08
+MIDAS_ALPHA=1.0
 
 
 # Parse command line arguments
@@ -61,6 +67,30 @@ while [[ $# -gt 0 ]]; do
             PREFETCH_RATIO="$2"
             shift 2
             ;;
+        --admission-source)
+            ADMISSION_SOURCE="$2"
+            shift 2
+            ;;
+        --w-demand)
+            W_DEMAND="$2"
+            shift 2
+            ;;
+        --w-intent)
+            W_INTENT="$2"
+            shift 2
+            ;;
+        --midas-eta)
+            MIDAS_ETA="$2"
+            shift 2
+            ;;
+        --midas-tau)
+            MIDAS_TAU="$2"
+            shift 2
+            ;;
+        --midas-alpha)
+            MIDAS_ALPHA="$2"
+            shift 2
+            ;;
         --help)
             echo "Usage: ./run_workflow.sh [options]"
             echo ""
@@ -68,13 +98,19 @@ while [[ $# -gt 0 ]]; do
             echo "  --start-date DATE                  Start date (default: 2026-02-07)"
             echo "  --end-date DATE                    End date (default: 2026-02-07)"
             echo "  --partition-date DATE              Backward-compatible alias for single-day run"
-            echo "  --max-requests NUM                 Max requests to sample (default: 10000000)"
+            echo "  --max-requests NUM                 Max requests to sample (default: 100000000)"
             echo "  --output-path PATH                 Output file path (default: workflow_ttl_methods_eval_TIMESTAMP.txt)"
-            echo "  --controlled-capacity NUM          Controlled cache capacity (default: 100)"
-            echo "  --uncontrolled-capacity NUM        Uncontrolled cache capacity (default: 900)"
-            echo "  --lru-capacity NUM                 LRU baseline capacity (default: 1000)"
+            echo "  --controlled-capacity NUM          Controlled cache capacity (default: 20000)"
+            echo "  --uncontrolled-capacity NUM        Uncontrolled cache capacity (default: 180000)"
+            echo "  --lru-capacity NUM                 LRU baseline capacity (default: 200000)"
             echo "  --score-percentile FLOAT           Score percentile (default: 0.7)"
             echo "  --prefetch-ratio FLOAT             Prefetch ratio (default: 0.2)"
+            echo "  --admission-source MODE            p_reuse|midas (default: midas)"
+            echo "  --w-demand FLOAT                   MIDAS demand weight (default: 0.85)"
+            echo "  --w-intent FLOAT                   MIDAS intent weight (default: 0.15)"
+            echo "  --midas-eta FLOAT                  MIDAS Markov smoothing exponent (default: 0.35)"
+            echo "  --midas-tau FLOAT                  MIDAS correction cap (default: 0.08)"
+            echo "  --midas-alpha FLOAT                MIDAS transition smoothing (default: 1.0)"
             echo "  --help                             Show this help message"
             echo ""
             echo "Examples:"
@@ -122,6 +158,12 @@ PYTHON_CMD=(
     --lru-capacity "$LRU_CAPACITY"
     --score-percentile "$SCORE_PERCENTILE"
     --prefetch-ratio "$PREFETCH_RATIO"
+    --admission-source "$ADMISSION_SOURCE"
+    --w-demand "$W_DEMAND"
+    --w-intent "$W_INTENT"
+    --midas-eta "$MIDAS_ETA"
+    --midas-tau "$MIDAS_TAU"
+    --midas-alpha "$MIDAS_ALPHA"
 )
 
 
@@ -138,6 +180,9 @@ echo "Uncontrolled Capacity:    $UNCONTROLLED_CAPACITY"
 echo "LRU Capacity:             $LRU_CAPACITY"
 echo "Score Percentile:         $SCORE_PERCENTILE"
 echo "Prefetch Ratio:           $PREFETCH_RATIO"
+echo "Admission Source:         $ADMISSION_SOURCE"
+echo "MIDAS Weights:            demand=$W_DEMAND intent=$W_INTENT"
+echo "MIDAS Params:             eta=$MIDAS_ETA tau=$MIDAS_TAU alpha=$MIDAS_ALPHA"
 echo "Python Interpreter:       $PYTHON_BIN"
 echo "=========================================="
 echo ""

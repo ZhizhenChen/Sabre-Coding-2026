@@ -51,7 +51,7 @@ class LeadTimeTTLBucket:
 @dataclass(frozen=True)
 class RequestContext:
     rq_timestamp: datetime
-    hotel_code: str
+    chain_code: str
     stay_start_date: str
     stay_end_date: str
     duration: int
@@ -665,7 +665,7 @@ if __name__ == "__main__":
 
     req = RequestContext(
         rq_timestamp=_utc_now(),
-        hotel_code="HY",
+        chain_code="HY",
         stay_start_date="2026-05-01",
         stay_end_date="2026-05-03",
         duration=2,
