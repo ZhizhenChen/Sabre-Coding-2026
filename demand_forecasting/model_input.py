@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 import importlib
 from typing import Dict, Optional
+import warnings
 
 import numpy as np
 import pandas as pd
@@ -135,15 +136,27 @@ class DemandScoreGenerator:
         if len(ts) < 2:
             return float(ts.mean() / (1.0 + ts.mean()))
 
+        start_ts = ts.index[0]
+        # Convert to tz-naive before Period conversion to avoid timezone-drop warning.
+        if getattr(start_ts, "tzinfo", None) is not None:
+            start_ts = start_ts.tz_localize(None)
+
         dataset = ListDataset([
             {
-                "start": ts.index[0].to_period("h"),
+                "start": start_ts.to_period("h"),
                 "target": ts.to_numpy(dtype=np.float32),
             }
-        ], freq="H")
+        ], freq="h")
 
         try:
-            forecast = next(predictor.predict(dataset))
+            # Suppress a known upstream warning in gluonts/torch indexing behavior.
+            with warnings.catch_warnings():
+                warnings.filterwarnings(
+                    "ignore",
+                    message="Using a non-tuple sequence for multidimensional indexing is deprecated.*",
+                    category=UserWarning,
+                )
+                forecast = next(predictor.predict(dataset))
             point = float(np.mean(forecast.mean))
         except Exception:
             point = float(ts.mean())

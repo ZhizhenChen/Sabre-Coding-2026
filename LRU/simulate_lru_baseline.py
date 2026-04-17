@@ -32,6 +32,7 @@ class LRUResult:
     source: str
     payload: Dict[str, Any]
     cached: bool
+    evicted_key: str | None = None
 
 
 class VanillaLRUCache:
@@ -53,13 +54,15 @@ class VanillaLRUCache:
                 source="lru_hit",
                 payload=payload,
                 cached=True,
+                evicted_key=None,
             )
 
         self.misses += 1
         payload = provider(request)
+        evicted_key: str | None = None
 
         if self.capacity > 0 and len(self._store) >= self.capacity:
-            self._store.popitem(last=False)
+            evicted_key, _ = self._store.popitem(last=False)
             self.evictions += 1
 
         if self.capacity > 0:
@@ -71,6 +74,7 @@ class VanillaLRUCache:
             source="lru_miss_admit",
             payload=payload,
             cached=True,
+            evicted_key=evicted_key,
         )
 
     def snapshot(self) -> List[str]:
@@ -81,125 +85,3 @@ class VanillaLRUCache:
 
     def size(self) -> int:
         return len(self._store)
-
-
-def _load_requests_from_partition(
-    partition_date: str = "2026-02-07",
-    partition_root: str = "data/cleaned_partitioned",
-    max_requests: int | None = None,
-) -> List[RequestContext]:
-    processor = DataPipelineProcessor(data_root=partition_root)
-    source_df, _ = processor.process(partition_date=partition_date, max_rows=max_requests)
-    if source_df.empty:
-        return []
-
-    request_df = source_df.copy()
-    # Keep request-level rows when explode-based features exist.
-    if "rq_correlation_id" in request_df.columns:
-        request_df = request_df.drop_duplicates(subset=["rq_correlation_id"])
-
-    request_df = request_df.dropna(
-        subset=["rq_timestamp", "rq_stay_start_date", "rq_stay_end_date", "chain_code", "location_city_code", "cache_key"]
-    )
-    request_df = request_df.sort_values("rq_timestamp", kind="stable").reset_index(drop=True)
-
-    requests: List[RequestContext] = []
-    for row in request_df.itertuples(index=False):
-        stay_start_date = pd.Timestamp(row.rq_stay_start_date).strftime("%Y-%m-%d")
-        stay_end_date = pd.Timestamp(row.rq_stay_end_date).strftime("%Y-%m-%d")
-        duration = max(0, (pd.Timestamp(row.rq_stay_end_date) - pd.Timestamp(row.rq_stay_start_date)).days)
-        requests.append(
-            RequestContext(
-                rq_timestamp=row.rq_timestamp.to_pydatetime(),
-                chain_code=str(row.chain_code),
-                stay_start_date=stay_start_date,
-                stay_end_date=stay_end_date,
-                duration=duration,
-                city_code=str(row.location_city_code),
-                cache_key_value=str(row.cache_key),
-            )
-        )
-
-    return requests
-
-
-def run_simulation(
-    output_path: str = "simulation_output_lru_2026-02-07.txt",
-    partition_date: str = "2026-02-07",
-    max_requests: int | None = None,
-) -> None:
-    provider = TruthPriceProvider(truth_price_by_key={})
-    lru = VanillaLRUCache(capacity=1000)
-
-    requests = _load_requests_from_partition(partition_date=partition_date, max_requests=max_requests)
-
-    unique_keys = len({request.cache_key() for request in requests})
-    total_requests = len(requests)
-
-    with open(output_path, "w", encoding="utf-8") as output_file:
-        with redirect_stdout(_Tee(sys.stdout, output_file)):
-            print(f"=== LRU Simulation for cleaned_partitioned/date={partition_date} ===")
-            print(f"Loaded requests: {total_requests}")
-            print(f"Unique cache keys: {unique_keys}")
-            print(f"Cache capacity: {lru.capacity}")
-
-            request_details: List[Dict[str, Any]] = []
-            for idx, request in enumerate(requests, start=1):
-                result = lru.get(request, provider)
-                if idx <= 20:
-                    request_details.append(
-                        {
-                            "request_num": idx,
-                            "timestamp": request.rq_timestamp.isoformat(),
-                            "key": result.key,
-                            "source": result.source,
-                            "cache_len": lru.size(),
-                        }
-                    )
-                if idx % 10000 == 0:
-                    print(f"Processed {idx}/{total_requests} requests...")
-
-            hit_rate = (lru.hits / total_requests) if total_requests else 0.0
-            miss_rate = (lru.misses / total_requests) if total_requests else 0.0
-            api_calls_saved = lru.hits
-            reduction_pct = (api_calls_saved / total_requests * 100.0) if total_requests else 0.0
-            unique_ratio = (unique_keys / total_requests) if total_requests else 0.0
-            repeat_request_rate = 1.0 - unique_ratio
-
-            print("\n=== Final Stats ===")
-            final_stats: Dict[str, Any] = {
-                "cache_size": lru.size(),
-                "cache_capacity": lru.capacity,
-                "requests_total": total_requests,
-                "unique_keys": unique_keys,
-                "hit_count": lru.hits,
-                "miss_count": lru.misses,
-                "eviction_count": lru.evictions,
-                "hit_rate": round(hit_rate, 4),
-                "miss_rate": round(miss_rate, 4),
-                "api_calls_saved": api_calls_saved,
-                "api_call_reduction_pct": round(reduction_pct, 2),
-                "repeat_request_rate": round(repeat_request_rate, 4),
-            }
-            for k, v in final_stats.items():
-                print(f"{k}: {v}")
-
-            print("\n=== Sample Request Details ===")
-            for detail in request_details:
-                print(
-                    f"Request {detail['request_num']} @ {detail['timestamp']}"
-                    f" | key={detail['key']}"
-                    f" | source={detail['source']}"
-                    f" | cache_len={detail['cache_len']}"
-                )
-
-
-            print(f"\nprovider_total_calls: {provider.calls}")
-
-    print(f"Saved simulation output to {output_path}")
-
-
-if __name__ == "__main__":
-    run_simulation()
-
-

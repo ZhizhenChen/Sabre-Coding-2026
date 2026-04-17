@@ -51,9 +51,11 @@ class DataPipelineProcessor:
 
         # Step 1.5: sampling for testing
         df = self._sample_raw_requests(df, max_requests=max_requests)
+        print(f"Loaded {len(df)} request rows after sampling (max_requests={max_requests}).")
 
         # Step 2: Data preprocessing (timestamps, lead_time, cache_key)
         df = self._preprocess_raw_data(df)
+        print(f"Data after preprocessing has {len(df)} rows.")
 
         # Step 3: Data cleanup (remove invalid geolocation)
         df = self._cleanup_location_data(df)
@@ -96,10 +98,14 @@ class DataPipelineProcessor:
 
         sampled = raw_df.copy()
         sampled["rq_timestamp"] = pd.to_datetime(sampled["rq_timestamp"], errors="coerce", utc=True)
-        sampled = sampled.dropna(subset=["rq_timestamp"]).sort_values("rq_timestamp", kind="stable")
+        sampled = sampled.dropna(subset=["rq_timestamp"])
 
         if max_requests is not None and max_requests > 0:
-            sampled = sampled.head(max_requests)
+            if len(sampled) > max_requests:
+                keep_index = sampled["rq_timestamp"].nsmallest(max_requests).index
+                sampled = sampled.loc[keep_index]
+
+        sampled = sampled.sort_values("rq_timestamp", kind="stable")
 
         return sampled.reset_index(drop=True)
     

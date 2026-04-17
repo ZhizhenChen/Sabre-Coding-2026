@@ -29,7 +29,7 @@ env/
 *.txt
 distribution_testing.py
 distribution_analysis.png
-
+demand_forecast_distribution_test.py
 
 # Optional: large local datasets (uncomment if needed)
 data/cleaned_partitioned/

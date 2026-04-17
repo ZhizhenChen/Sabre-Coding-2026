@@ -35,6 +35,9 @@ lambda_model = importlib.import_module("lambda_model")
 build_lambda_table = lambda_model.build_lambda_table
 _km_survival = lambda_model._km_survival
 _median_from_survival = lambda_model._median_from_survival
+_weighted_global_lambda = lambda_model.weighted_global_lambda
+_bucket_weighted_lambda = lambda_model.bucket_weighted_lambda
+_ttl_from_lambda_model = lambda_model.ttl_from_lambda
 
 LEAD_TIME_BREAKS = [1, 3, 7, 30]
 LEAD_TIME_LABELS = ["same_day", "short", "mid", "long", "very_long"]
@@ -63,7 +66,7 @@ class EvalSummary:
     eviction_count: int
     eviction_accuracy: float
     wrong_eviction_count: int
-    avg_query_after_eviction: float
+    avg_query_count_after_eviction: float
     api_call_reduction_pct_vs_lru: float
 
 
@@ -78,11 +81,11 @@ class LRUSummary:
     eviction_count: int
     eviction_accuracy: float
     wrong_eviction_count: int
-    avg_query_after_eviction: float
+    avg_query_count_after_eviction: float
 
 
 
-def _build_truth_price_lookup(source_df: pd.DataFrame) -> Dict[str, List[Dict[str, Any]]]:
+def _build_truth_price_lookup(source_df: pd.DataFrame) -> Dict[str, Dict[str, List[Any]]]:
     """
     Build a time-ordered price lookup for each cache_key from unexploded request data.
     
@@ -95,20 +98,26 @@ def _build_truth_price_lookup(source_df: pd.DataFrame) -> Dict[str, List[Dict[st
     Returns:
         Dict mapping cache_key -> List of {timestamp, offers} dicts, sorted by timestamp
     """
-    lookup: Dict[str, List[Dict[str, Any]]] = {}
+    lookup: Dict[str, Dict[str, List[Any]]] = {}
     
     df = source_df.dropna(subset=["cache_key", "rq_timestamp", "convertedrate_infos"]).copy()
     df["rq_timestamp"] = pd.to_datetime(df["rq_timestamp"], errors="coerce", utc=True)
     df = df.sort_values(["cache_key", "rq_timestamp"])
     
     for cache_key, group in df.groupby("cache_key", dropna=False):
-        time_price_list = []
-        for _, row in group.iterrows():
-            timestamp = row["rq_timestamp"]
+        timestamps: List[Any] = []
+        offers_by_timestamp: List[List[Dict[str, Any]]] = []
+        for row in group.itertuples(index=False):
+            timestamp = row.rq_timestamp
             offers = []
             
             # Extract all offers from convertedrate_infos
-            rate_infos = row["convertedrate_infos"]
+            rate_infos = row.convertedrate_infos
+            if isinstance(rate_infos, np.ndarray):
+                rate_infos = rate_infos.tolist()
+            elif isinstance(rate_infos, tuple):
+                rate_infos = list(rate_infos)
+
             if rate_infos is not None and isinstance(rate_infos, list):
                 for offer in rate_infos:
                     if isinstance(offer, dict):
@@ -121,13 +130,14 @@ def _build_truth_price_lookup(source_df: pd.DataFrame) -> Dict[str, List[Dict[st
                             })
             
             if offers:
-                time_price_list.append({
-                    "timestamp": timestamp,
-                    "offers": offers,
-                })
-        
-        if time_price_list:
-            lookup[str(cache_key)] = time_price_list
+                timestamps.append(timestamp)
+                offers_by_timestamp.append(offers)
+
+        if timestamps:
+            lookup[str(cache_key)] = {
+                "timestamps": timestamps,
+                "offers": offers_by_timestamp,
+            }
     
     return lookup
 
@@ -145,7 +155,7 @@ def _extract_price(payload: Any) -> float | None:
 def _get_truth_price_for_request(
     cache_key: str,
     request_timestamp: Any,
-    truth_price_by_key: Dict[str, List[Dict[str, Any]]],
+    truth_price_by_key: Dict[str, Dict[str, List[Any]]],
 ) -> float | None:
     """
     Get ground truth price for a request by matching its cache_key and timestamp.
@@ -163,29 +173,20 @@ def _get_truth_price_for_request(
     if cache_key not in truth_price_by_key:
         return None
     
-    time_series = truth_price_by_key[cache_key]  # List of {timestamp, offers}
+    time_series = truth_price_by_key[cache_key]
     request_ts = pd.Timestamp(request_timestamp).to_pydatetime() if not isinstance(request_timestamp, (pd.Timestamp, datetime)) else request_timestamp
     if hasattr(request_ts, 'replace'):
         request_ts = request_ts.replace(tzinfo=timezone.utc) if request_ts.tzinfo is None else request_ts
     
-    closest_idx = None
-    for i, entry in enumerate(time_series):
-        entry_ts = entry["timestamp"]
-        if entry_ts <= request_ts:
-            closest_idx = i
-        else:
-            break
-    
-    if closest_idx is not None:
-        offers = time_series[closest_idx]["offers"]
+    timestamps = time_series.get("timestamps", [])
+    offers_list = time_series.get("offers", [])
+    closest_idx = bisect_right(timestamps, request_ts) - 1
+
+    if closest_idx >= 0 and closest_idx < len(offers_list):
+        offers = offers_list[closest_idx]
         if offers:
             return float(offers[0].get("price", 0.0))
     return None
-
-
-def _workflow_cache_keys(workflow: SabreCacheWorkflow) -> set[str]:
-    with workflow._lock:
-        return set(workflow._controlled.keys()) | set(workflow._uncontrolled.keys())
 
 
 def _assign_lead_time_bucket(lead_time_days: int) -> str:
@@ -200,9 +201,12 @@ def _bucketize_lead_time(series: pd.Series) -> pd.Series:
 
 
 def _ttl_from_lambda(lambda_val: float) -> int:
-    safe_lambda = max(float(lambda_val), 1e-6)
-    ttl = -math.log(TTL_TARGET_FRESHNESS) / safe_lambda
-    return int(max(MIN_TTL_SECONDS, min(MAX_TTL_SECONDS, ttl * 3600.0)))
+    return _ttl_from_lambda_model(
+        lambda_val=lambda_val,
+        target_freshness=TTL_TARGET_FRESHNESS,
+        min_ttl_seconds=MIN_TTL_SECONDS,
+        max_ttl_seconds=MAX_TTL_SECONDS,
+    )
 
 
 def _lambda_from_ttl_seconds(ttl_seconds: int) -> float:
@@ -268,35 +272,47 @@ def _build_km_ttl_lookup(source_df: pd.DataFrame) -> Dict[str, int]:
 
         ttl_lookup[str(bucket)] = int(max(MIN_TTL_SECONDS, min(MAX_TTL_SECONDS, ttl_hours * 3600.0)))
 
+    if len(ttl_lookup) < len(LEAD_TIME_LABELS):
+        fallback_table = build_lambda_table(source_df, min_intervals=1, method="fallback")
+        if not fallback_table.empty:
+            fallback_table = fallback_table.copy()
+            fallback_table["lead_time_bucket"] = _bucketize_lead_time(fallback_table["lead_time"])
+            global_lambda = _weighted_global_lambda(
+                fallback_table,
+                lambda_col="lambda_final",
+                weight_col="exposure_hours",
+                default_lambda=0.1,
+            )
+            fallback_ttl = _ttl_from_lambda(global_lambda)
+            for bucket in LEAD_TIME_LABELS:
+                ttl_lookup.setdefault(bucket, fallback_ttl)
+
     return ttl_lookup
 
 
 def _build_lambda_based_ttl_lookup(source_df: pd.DataFrame, method: str) -> Dict[str, int]:
     table = build_lambda_table(source_df, min_intervals=1, method=method)
     if table.empty:
+        table = build_lambda_table(source_df, min_intervals=1, method="fallback")
+    if table.empty:
         return {}
 
     frame = table.copy()
     frame["lead_time_bucket"] = _bucketize_lead_time(frame["lead_time"])
 
-    weighted_lambda = (
-        frame.groupby("lead_time_bucket", dropna=False)
-        .apply(
-            lambda g: float(np.average(g["lambda_final"], weights=g["exposure_hours"]))
-            if float(g["exposure_hours"].sum()) > 0
-            else float(g["lambda_final"].mean())
-        )
-        .to_dict()
+    weighted_lambda = _bucket_weighted_lambda(
+        frame,
+        bucket_col="lead_time_bucket",
+        lambda_col="lambda_final",
+        weight_col="exposure_hours",
     )
 
-    total_exposure = float(frame["exposure_hours"].sum())
-    global_lambda = (
-        float(np.average(frame["lambda_final"], weights=frame["exposure_hours"]))
-        if total_exposure > 0
-        else float(frame["lambda_final"].mean())
+    global_lambda = _weighted_global_lambda(
+        frame,
+        lambda_col="lambda_final",
+        weight_col="exposure_hours",
+        default_lambda=0.1,
     )
-    if not np.isfinite(global_lambda) or global_lambda <= 0:
-        global_lambda = 0.1
 
     lookup: Dict[str, int] = {}
     for bucket in LEAD_TIME_LABELS:
@@ -319,7 +335,18 @@ def _build_ttl_lookup(source_df: pd.DataFrame, ttl_method: str) -> Dict[str, int
     raise ValueError(f"Unsupported ttl_method='{ttl_method}'. Use one of: glm, pp, rule_based, km")
 
 
-
+def _request_context_from_row(row: Any) -> RequestContext:
+    return RequestContext(
+        rq_timestamp=row.rq_timestamp.to_pydatetime() if hasattr(row.rq_timestamp, "to_pydatetime") else row.rq_timestamp,
+        chain_code=str(row.chain_code),
+        stay_start_date=str(pd.Timestamp(row.rq_stay_start_date).strftime("%Y-%m-%d")),
+        stay_end_date=str(pd.Timestamp(row.rq_stay_end_date).strftime("%Y-%m-%d")),
+        duration=int(row.duration),
+        city_code=str(row.location_city_code),
+        lead_time_days=int(row.lead_time) if hasattr(row, "lead_time") else None,
+        cache_key_value=str(row.cache_key),
+        hotel_code=str(row.hotel_code) if hasattr(row, "hotel_code") else None,
+    )
 
 def _prepare_requests(
     requests_df: pd.DataFrame,
@@ -336,16 +363,7 @@ def _prepare_requests(
 
     prepared: List[PreparedWorkflowInput] = []
     for row in merged.itertuples(index=False):
-        request = RequestContext(
-            rq_timestamp=row.rq_timestamp.to_pydatetime() if hasattr(row.rq_timestamp, "to_pydatetime") else row.rq_timestamp,
-            chain_code=str(row.chain_code),
-            stay_start_date=str(pd.Timestamp(row.rq_stay_start_date).strftime("%Y-%m-%d")),
-            stay_end_date=str(pd.Timestamp(row.rq_stay_end_date).strftime("%Y-%m-%d")),
-            duration=int(row.duration),
-            city_code=str(row.location_city_code),
-            lead_time_days=int(row.lead_time),
-            cache_key_value=str(row.cache_key),
-        )
+        request = _request_context_from_row(row)
         # Calculate lambda_i from TTL lookup based on lead time
         lambda_i = _admission_lambda_for_request(request, ttl_lookup_by_bucket)
         prepared.append(
@@ -363,7 +381,7 @@ def _run_ttl_method(
     requests_df: pd.DataFrame,
     prepared_requests: List[PreparedWorkflowInput],
     ttl_lookup_by_bucket: Dict[str, int],
-    truth_price_by_key: Dict[str, List[Dict[str, Any]]],
+    truth_price_by_key: Dict[str, Dict[str, List[Any]]],
     lru_provider_calls: int,
     controlled_capacity: int = 100,
     uncontrolled_capacity: int = 900,
@@ -402,14 +420,10 @@ def _run_ttl_method(
         request = item.request
         key = request.cache_key()
         requests_by_key[key].append(idx)
-        before_keys = _workflow_cache_keys(workflow)
         admission_lambda = _admission_lambda_for_request(request, ttl_lookup_by_bucket)
         result = workflow.get(request, p_reuse=item.p_reuse, lambda_i=admission_lambda, provider=provider)
-        after_keys = _workflow_cache_keys(workflow)
-
-        evicted_keys = before_keys - after_keys
-        for evicted_key in evicted_keys:
-            eviction_events.append((evicted_key, idx))
+        if result.evicted_key is not None:
+            eviction_events.append((result.evicted_key, idx))
 
         if "hit" in result.source:
             hit_count += 1
@@ -441,8 +455,8 @@ def _run_ttl_method(
         if future_queries > 5:
             wrong_eviction_count += 1
 
-    eviction_accuracy = queried_after_eviction / evictions if evictions else 0.0
-    avg_query_after_eviction = mean(later_query_counts) if later_query_counts else 0.0
+    eviction_accuracy = 1- queried_after_eviction / evictions if evictions else 0.0
+    avg_query_count_after_eviction = mean(later_query_counts) if later_query_counts else 0.0
     stale_rate_served_pct = stale_response_count / hit_count if hit_count else 0.0
 
     api_call_reduction = 1.0 - (provider.calls / lru_provider_calls) if lru_provider_calls else 0.0
@@ -467,52 +481,33 @@ def _run_ttl_method(
         eviction_count=evictions,
         eviction_accuracy=eviction_accuracy,
         wrong_eviction_count=wrong_eviction_count,
-        avg_query_after_eviction=avg_query_after_eviction,
+        avg_query_count_after_eviction=avg_query_count_after_eviction,
         api_call_reduction_pct_vs_lru=api_call_reduction * 100.0,
     )
 
 
 def _run_lru_baseline(
     requests_df: pd.DataFrame,
-    truth_price_by_key: Dict[str, List[Dict[str, Any]]],
+    truth_price_by_key: Dict[str, Dict[str, List[Any]]],
     lru_capacity: int = 1000,
 ) -> LRUSummary:
     provider = TruthPriceProvider(truth_price_by_key)
     lru = VanillaLRUCache(capacity=lru_capacity)
 
-    hit_count = 0
-    miss_count = 0
     eviction_events: List[Tuple[str, int]] = []
     requests_by_key: Dict[str, List[int]] = defaultdict(list)
 
     for idx, row in enumerate(requests_df.itertuples(index=False), start=1):
-        request = RequestContext(
-            rq_timestamp=row.rq_timestamp.to_pydatetime() if hasattr(row.rq_timestamp, "to_pydatetime") else row.rq_timestamp,
-            chain_code=str(row.chain_code),
-            stay_start_date=str(pd.Timestamp(row.rq_stay_start_date).strftime("%Y-%m-%d")),
-            stay_end_date=str(pd.Timestamp(row.rq_stay_end_date).strftime("%Y-%m-%d")),
-            duration=int(row.duration),
-            city_code=str(row.location_city_code),
-            cache_key_value=str(row.cache_key),
-        )
+        request = _request_context_from_row(row)
         key = request.cache_key()
         requests_by_key[key].append(idx)
-        before_keys = set(lru._store.keys())
         result = lru.get(request, provider)
-        after_keys = set(lru._store.keys())
-
-        if result.source == "lru_hit":
-            hit_count += 1
-        else:
-            miss_count += 1
-
-        evicted_keys = before_keys - after_keys
-        for evicted_key in evicted_keys:
-            eviction_events.append((evicted_key, idx))
+        if result.evicted_key is not None:
+            eviction_events.append((result.evicted_key, idx))
 
     total_requests = len(requests_df)
     unique_keys = int(requests_df["cache_key"].nunique())
-    hit_rate = hit_count / total_requests if total_requests else 0.0
+    hit_rate = lru.hits / total_requests if total_requests else 0.0
     eviction_count = len(eviction_events)
 
     later_query_counts: List[int] = []
@@ -529,14 +524,14 @@ def _run_lru_baseline(
     return LRUSummary(
         total_requests=total_requests,
         unique_keys=unique_keys,
-        hit_count=hit_count,
-        miss_count=miss_count,
+        hit_count=lru.hits,
+        miss_count=lru.misses,
         provider_calls=provider.calls,
         hit_rate=hit_rate,
         eviction_count=eviction_count,
-        eviction_accuracy=queried_after_eviction / eviction_count if eviction_count else 0.0,
+        eviction_accuracy=1- queried_after_eviction / eviction_count if eviction_count else 0.0,
         wrong_eviction_count=wrong_eviction_count,
-        avg_query_after_eviction=mean(later_query_counts) if later_query_counts else 0.0,
+        avg_query_count_after_eviction=mean(later_query_counts) if later_query_counts else 0.0,
     )
 
 
@@ -554,10 +549,13 @@ def run_ttl_method_eval(
     processor = DataPipelineProcessor(data_root=str(ROOT_DIR / "data" / "cleaned_partitioned"))
 
     source_df, prepared_df = processor.process(start_date=start_date, end_date=end_date, max_requests=max_requests)
+    print(f"Loaded and processed data: source_df={len(source_df)} rows, prepared_df={len(prepared_df)} rows")
+
 
     # Build a dedicated frame for lambda estimation only (needs price_change).
     pricing_source_df = processor._process_rates_and_prices(source_df.copy())
     pricing_source_df = processor._compute_market_and_price_change(pricing_source_df)
+
 
     model_generator = DemandScoreGenerator()
     p_reuse_df = model_generator.generate_demand_scores(
@@ -566,10 +564,15 @@ def run_ttl_method_eval(
         num_samples=None,
         output_parquet=None,
     )
+    print(f"Generated demand scores: p_reuse_df={len(p_reuse_df)} rows")
 
     # Build time-ordered truth price lookup from unexploded source data
     truth_price_by_key = _build_truth_price_lookup(source_df)
+    print(f"Built truth price lookup for {len(truth_price_by_key)} unique cache keys")
+
     lru_summary = _run_lru_baseline(source_df, truth_price_by_key=truth_price_by_key, lru_capacity=lru_capacity)
+    print(f"Completed LRU baseline evaluation: {lru_summary}")
+
 
     ttl_methods = ["glm", "pp", "rule_based", "km"]
     evals: List[EvalSummary] = []
@@ -580,6 +583,7 @@ def run_ttl_method_eval(
         ttl_lookups[method] = ttl_lookup
         # Prepare requests with lambda_i from this TTL method
         prepared_requests = _prepare_requests(source_df, p_reuse_df, ttl_lookup)
+        print(f"Prepared requests for {method.upper()}: {len(prepared_requests)}")
         # lines.append(method.upper() + " TTL Lookup:")
         # for i in prepared_requests:
         #     lines.append(f"Prepared request: cache_key={i.request.cache_key()}, rq_timestamp = {i.request.rq_timestamp}, p_reuse={i.p_reuse:.4f}, lambda_i={i.lambda_i:.6f}")
@@ -597,7 +601,9 @@ def run_ttl_method_eval(
                 prefetch_ratio=prefetch_ratio,
             )
         )
-
+        print(f"Completed TTL method evaluation for {method.upper()}: {evals[-1]}")
+    
+    
     # lines: List[str] = []
     lines.append("TTL METHOD EVAL (admission score uses TTL-implied lambda)")
 
@@ -635,7 +641,7 @@ def run_ttl_method_eval(
         lines.append(f"prewarm_precision: {summary.prewarm_precision:.4f}")
         lines.append(f"eviction_count: {summary.eviction_count}")
         lines.append(f"eviction_accuracy: {summary.eviction_accuracy:.4f}")
-        lines.append(f"avg_query_after_eviction: {summary.avg_query_after_eviction:.4f}")
+        lines.append(f"avg_query_count_after_eviction: {summary.avg_query_count_after_eviction:.4f}")
         lines.append("ttl_lookup_by_bucket:")
         lookup = ttl_lookups.get(summary.ttl_method, {})
         for bucket in LEAD_TIME_LABELS:

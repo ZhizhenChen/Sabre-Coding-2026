@@ -40,9 +40,10 @@ def _group_level_stats(df_enriched: pd.DataFrame) -> pd.DataFrame:
 	rows = []
 	group_key = _resolve_group_key(df_enriched)
 	group_cols = [group_key, "lead_time", "rate_source"]
+	sorted_df = df_enriched.sort_values(group_cols + ["rq_timestamp"])
 
-	for keys, g in df_enriched.groupby(group_cols, dropna=False):
-		summary = estimate_lambda_km(g)
+	for keys, g in sorted_df.groupby(group_cols, dropna=False, sort=False):
+		summary = estimate_lambda_km(g, assume_sorted=True)
 		rows.append(
 			{
 				"hotel_code": str(keys[0]),
@@ -76,18 +77,18 @@ def _km_survival(durations: np.ndarray, events: np.ndarray) -> tuple[np.ndarray,
 	if len(durations) == 0:
 		return np.array([]), np.array([])
 
-	times = np.sort(np.unique(durations))
-	survival = []
-	s = 1.0
+	order = np.argsort(durations)
+	d_sorted = durations[order]
+	e_sorted = events[order]
 
-	for t in times:
-		n_at_risk = np.sum(durations >= t)
-		d_t = np.sum((durations == t) & (events == 1))
-		if n_at_risk > 0:
-			s *= (1.0 - d_t / n_at_risk)
-		survival.append(s)
+	times, first_idx, counts = np.unique(d_sorted, return_index=True, return_counts=True)
 
-	return times, np.array(survival)
+	n_at_risk = np.cumsum(counts[::-1])[::-1].astype(float)
+	d_t = np.add.reduceat((e_sorted == 1).astype(float), first_idx)
+
+	hazard = np.where(n_at_risk > 0.0, 1.0 - (d_t / n_at_risk), 1.0)
+	survival = np.cumprod(hazard)
+	return times, survival
 
 
 def _median_from_survival(times: np.ndarray, survival: np.ndarray) -> float:
@@ -112,8 +113,8 @@ def _rmst_from_survival(times: np.ndarray, survival: np.ndarray) -> float:
 	return area
 
 
-def estimate_lambda_km(group_df: pd.DataFrame) -> KMSummary:
-	g = group_df.sort_values("rq_timestamp").copy()
+def estimate_lambda_km(group_df: pd.DataFrame, assume_sorted: bool = False) -> KMSummary:
+	g = group_df.copy() if assume_sorted else group_df.sort_values("rq_timestamp").copy()
 	#delta_hours = time between consecutive requests in hours
 	g["delta_hours"] = g["rq_timestamp"].diff().dt.total_seconds() / 3600.0
 	g["event_change"] = g["price_change"].astype(int)
@@ -265,6 +266,67 @@ def build_lambda_table_fallback(df_enriched: pd.DataFrame, min_intervals: int = 
 	out["lambda_method"] = "fallback"
 	out["lambda_debug_reason"] = ""
 	return out.sort_values("n_intervals", ascending=False).reset_index(drop=True)
+
+
+def weighted_global_lambda(
+	frame: pd.DataFrame,
+	lambda_col: str = "lambda_final",
+	weight_col: str = "exposure_hours",
+	default_lambda: float = 0.1,
+) -> float:
+	"""Compute a global lambda using exposure-weighted mean with safe fallback."""
+	if frame.empty or lambda_col not in frame.columns:
+		return float(default_lambda)
+
+	if weight_col in frame.columns:
+		total_weight = float(frame[weight_col].sum())
+		if total_weight > 0:
+			value = float(np.average(frame[lambda_col], weights=frame[weight_col]))
+		else:
+			value = float(frame[lambda_col].mean())
+	else:
+		value = float(frame[lambda_col].mean())
+
+	if not np.isfinite(value) or value <= 0:
+		return float(default_lambda)
+	return value
+
+
+def bucket_weighted_lambda(
+	frame: pd.DataFrame,
+	bucket_col: str = "lead_time_bucket",
+	lambda_col: str = "lambda_final",
+	weight_col: str = "exposure_hours",
+) -> dict[str, float]:
+	"""Compute exposure-weighted lambda per bucket."""
+	if frame.empty:
+		return {}
+
+	if bucket_col not in frame.columns or lambda_col not in frame.columns:
+		return {}
+
+	bucket_mean = frame.groupby(bucket_col, dropna=False)[lambda_col].mean()
+	if weight_col not in frame.columns:
+		return bucket_mean.astype(float).to_dict()
+
+	weight_sum = frame.groupby(bucket_col, dropna=False)[weight_col].sum()
+	weighted_sum = (frame[lambda_col] * frame[weight_col]).groupby(frame[bucket_col], dropna=False).sum()
+	weighted_avg = weighted_sum / weight_sum.replace(0, np.nan)
+	resolved = weighted_avg.fillna(bucket_mean)
+	return resolved.astype(float).to_dict()
+
+
+def ttl_from_lambda(
+	lambda_val: float,
+	target_freshness: float = 0.8,
+	min_ttl_seconds: int = 60,
+	max_ttl_seconds: int = 24 * 3600,
+) -> int:
+	"""Convert lambda to TTL seconds with bounds and numeric guards."""
+	safe_lambda = max(float(lambda_val), 1e-6)
+	safe_target = min(max(float(target_freshness), 1e-6), 1.0 - 1e-6)
+	ttl_hours = -math.log(safe_target) / safe_lambda
+	return int(max(min_ttl_seconds, min(max_ttl_seconds, ttl_hours * 3600.0)))
 
 
 def build_lambda_table(
