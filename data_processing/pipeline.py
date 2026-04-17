@@ -10,6 +10,13 @@ import pandas as pd
 from pathlib import Path
 from typing import Tuple, Optional, List
 
+from demand_forecasting.feature_rules import (
+    ap_bucket_label,
+    assign_geo_grid,
+    duration_bucket_label,
+    rating_bucket_label,
+)
+
 
 class DataPipelineProcessor:
     """
@@ -26,13 +33,14 @@ class DataPipelineProcessor:
         self.data_root = Path(data_root)
         self.top_n_hotels = 300
 
-    def process(self, partition_date: str, max_rows: Optional[int] = None) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    def process(self, start_date: str, end_date: str, max_requests: int | None = None) -> Tuple[pd.DataFrame, pd.DataFrame]:
         """
-        Main entry point: load data for a date and produce prepared features.
+        Main entry point: load data for a date range and produce prepared features.
 
         Args:
-            partition_date: Date string (e.g., '2026-02-07')
-            max_rows: Optional row limit for testing/sampling
+            start_date: Start date string (e.g., '2026-02-07')
+            end_date: End date string (e.g., '2026-02-07')
+            max_requests: Optional row limit for testing/sampling
 
         Returns:
             (source_df, prepared_df) where:
@@ -40,19 +48,18 @@ class DataPipelineProcessor:
             - prepared_df: hourly-aggregated features with all engineered columns
         """
         # Step 1: Load raw data
-        df = self._load_raw_data(partition_date, max_rows)
+        df = self._load_raw_data(start_date, end_date)
+
+        # Step 1.5: sampling for testing
+        df = self._sample_raw_requests(df, max_requests=max_requests)
+        print(f"Loaded {len(df)} request rows after sampling (max_requests={max_requests}).")
 
         # Step 2: Data preprocessing (timestamps, lead_time, cache_key)
         df = self._preprocess_raw_data(df)
+        print(f"Data after preprocessing has {len(df)} rows.")
 
         # Step 3: Data cleanup (remove invalid geolocation)
         df = self._cleanup_location_data(df)
-
-        # Step 4: Rate and price processing
-        df = self._process_rates_and_prices(df)
-
-        # Step 5: Market and price change features
-        df = self._compute_market_and_price_change(df)
 
         # Step 6: Create source_df (enriched row-level) and produce prepared hourly features
         source_df = df.copy()
@@ -60,31 +67,49 @@ class DataPipelineProcessor:
 
         return source_df, prepared_df
 
-    def _load_raw_data(self, partition_date: str, max_rows: Optional[int] = None) -> pd.DataFrame:
-        """Load parquet data for specific partition date."""
-        path = self.data_root / f"date={partition_date}"
-        
-        if not path.exists():
-            raise FileNotFoundError(f"Partition path not found: {path}")
-
-        # Find all parquet files
-        parquet_files = list(path.glob("*.parquet"))
-        if not parquet_files:
-            raise FileNotFoundError(f"No parquet files found in {path}")
-
+    def _load_raw_data(self, start_date: str, end_date: str) -> pd.DataFrame:
+        """Load parquet data for specific date range."""
+        date_list = pd.date_range(start=start_date, end=end_date, freq="D")
+        if len(date_list) == 0:
+            raise ValueError(f"No dates found between start_date={start_date} and end_date={end_date}.")
         dfs = []
-        for pf in parquet_files:
-            df = pd.read_parquet(pf)
-            if max_rows:
-                df = df.head(max_rows)
-            dfs.append(df)
+        for dt in date_list:
+            day = dt.strftime("%Y-%m-%d")
+            path = self.data_root / f"date={day}"
+            if not path.exists():
+                raise FileNotFoundError(f"Partition path not found: {path}")
 
-        df = pd.concat(dfs, ignore_index=True)
-        if max_rows:
-            df = df.head(max_rows)
+            # Find all parquet files
+            parquet_files = list(path.glob("*.parquet"))
+            if not parquet_files:
+                raise FileNotFoundError(f"No parquet files found in {path}")
+            for pf in parquet_files:
+                df = pd.read_parquet(pf)
+                dfs.append(df)
+                
+        total_df = pd.concat(dfs, ignore_index=True) 
 
-        return df
+        return total_df
 
+
+    def _sample_raw_requests(self, raw_df: pd.DataFrame, max_requests: int | None = None) -> pd.DataFrame:
+        """Sample request rows before feature engineering."""
+        if raw_df.empty:
+            return raw_df.copy()
+
+        sampled = raw_df.copy()
+        sampled["rq_timestamp"] = pd.to_datetime(sampled["rq_timestamp"], errors="coerce", utc=True)
+        sampled = sampled.dropna(subset=["rq_timestamp"])
+
+        if max_requests is not None and max_requests > 0:
+            if len(sampled) > max_requests:
+                keep_index = sampled["rq_timestamp"].nsmallest(max_requests).index
+                sampled = sampled.loc[keep_index]
+
+        sampled = sampled.sort_values("rq_timestamp", kind="stable")
+
+        return sampled.reset_index(drop=True)
+    
     def _preprocess_raw_data(self, df: pd.DataFrame) -> pd.DataFrame:
         """Convert timestamps, compute lead_time, cache_key, hour."""
         df = df.copy()
@@ -231,95 +256,59 @@ class DataPipelineProcessor:
         )
         return df
 
+
+    # ====================================================
+    # Hourly Feature Generation (DeepAR Optimized)
+    # ====================================================
     def _create_hourly_features(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Aggregate row-level data to hourly features."""
+        """
+        Data preparation formatted specifically for DeepAR Walk-Forward inference.
+        Applies strict bucketing and drops missing values. 
+        Note: Manual lag features are omitted as DeepAR's LSTM handles temporal context internally.
+        """
         source_df_copy = df.copy()
-        source_df_copy['rq_timestamp'] = pd.to_datetime(source_df_copy['rq_timestamp'], utc=True)
-        source_df_copy['timestamp_hour'] = source_df_copy['rq_timestamp'].dt.floor('h')
 
-        # Request-level deduplication
-        if 'rq_correlation_id' in source_df_copy.columns:
-            request_level = source_df_copy.drop_duplicates(subset=['rq_correlation_id']).copy()
-        else:
-            request_level = source_df_copy.copy()
+        # 1. Map variable names to match the forecasting pipeline
+        if 'AP' not in source_df_copy.columns and 'lead_time' in source_df_copy.columns:
+            source_df_copy['AP'] = source_df_copy['lead_time']
+        if 'stay_duration' not in source_df_copy.columns and 'duration' in source_df_copy.columns:
+            source_df_copy['stay_duration'] = source_df_copy['duration']
 
-        request_level['request_count'] = 1
+        # 2. Generate spatial grid (geo_grid_auto)
+        source_df_copy = assign_geo_grid(source_df_copy)
 
-        # Aggregate to cache_key + hour
-        hourly = (
-            request_level.groupby(['cache_key', 'timestamp_hour'], dropna=False)
-            .agg(
-                request_count=('request_count', 'sum'),
-                lead_time=('lead_time', 'median'),
-            )
-            .reset_index()
-            .sort_values(['cache_key', 'timestamp_hour'])
-            .reset_index(drop=True)
+        # 3. Purge rows with missing essential attributes (Crucial for clean DeepAR inference)
+        source_df_copy = source_df_copy.dropna(subset=['sabre_rating', 'chain_code', 'stay_duration', 'AP'])
+
+        # 4. Apply categorical bucketing
+        source_df_copy['AP_bucket'] = source_df_copy['AP'].apply(ap_bucket_label)
+        source_df_copy['stay_bucket'] = source_df_copy['stay_duration'].apply(duration_bucket_label)
+        source_df_copy['rating_bucket'] = source_df_copy['sabre_rating'].apply(rating_bucket_label)
+        
+        # Chain bucketing (Top 50 logic)
+        top_50_chains = set(source_df_copy['chain_code'].value_counts().nlargest(50).index.tolist())
+        source_df_copy['chain_bucket'] = source_df_copy['chain_code'].apply(
+            lambda x: f"Chain_{x}" if x in top_50_chains else 'Chain_others'
         )
 
-        # Fill continuous hour series
-        frames = []
-        for cache_key, group in hourly.groupby('cache_key'):
-            group = group.sort_values('timestamp_hour').set_index('timestamp_hour')
-            full_index = pd.date_range(group.index.min(), group.index.max(), freq='h', tz='UTC')
-            expanded = group.reindex(full_index)
-            expanded['cache_key'] = cache_key
-            expanded['request_count'] = expanded['request_count'].fillna(0)
-            expanded['lead_time'] = expanded['lead_time'].ffill().bfill().fillna(0)
-            expanded = expanded.reset_index().rename(columns={'index': 'timestamp_hour'})
-            frames.append(expanded)
+        # Remove "Exclude" buckets
+        for col in ['AP_bucket', 'stay_bucket', 'rating_bucket', 'chain_bucket']:
+            source_df_copy = source_df_copy[source_df_copy[col] != "Exclude"]
 
-        df_hourly = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(
-            columns=['cache_key', 'timestamp_hour', 'request_count', 'lead_time']
-        )
+        source_df_copy = source_df_copy[source_df_copy['geo_grid_auto'] != 'Unknown']
 
-        # Temporal features
-        df_hourly['hour_of_day'] = df_hourly['timestamp_hour'].dt.hour
-        df_hourly['day_of_week'] = df_hourly['timestamp_hour'].dt.dayofweek
-        df_hourly['is_weekend'] = (df_hourly['day_of_week'] >= 5).astype(int)
-        df_hourly['is_holiday'] = 0
+        # 5. Create conditional keys specific to DeepAR logic
+        source_df_copy['rating_loc'] = source_df_copy['rating_bucket'].astype(str) + "_|_" + source_df_copy['geo_grid_auto'].astype(str)
+        source_df_copy['rating_chain'] = source_df_copy['rating_bucket'].astype(str) + "_|_" + source_df_copy['chain_bucket'].astype(str)
 
-        # Lags and rolling features
-        df_hourly = df_hourly.sort_values(['cache_key', 'timestamp_hour'])
-        df_hourly['lag_1h'] = df_hourly.groupby('cache_key')['request_count'].shift(1).fillna(0)
-        df_hourly['lag_2h'] = df_hourly.groupby('cache_key')['request_count'].shift(2).fillna(0)
-        df_hourly['past_3h'] = (
-            df_hourly.groupby('cache_key')['request_count']
-            .rolling(3).sum().reset_index(level=0, drop=True).fillna(0)
-        )
-        df_hourly['past_6h'] = (
-            df_hourly.groupby('cache_key')['request_count']
-            .rolling(6).sum().reset_index(level=0, drop=True).fillna(0)
-        )
+        source_df_copy['timestamp_hour'] = pd.to_datetime(source_df_copy['rq_timestamp'], utc=True).dt.floor('h')
 
-        # Request time gap
-        df_hourly['last_request_time'] = (
-            df_hourly.groupby('cache_key')['timestamp_hour']
-            .transform(lambda x: x.where(df_hourly.loc[x.index, 'request_count'] > 0).ffill())
-        )
-        df_hourly['request_time_gap'] = (
-            (df_hourly['timestamp_hour'] - df_hourly['last_request_time']).dt.total_seconds() / 3600.0
-        ).fillna(999.0)
+        # 6. Aggregate demand by all DeepAR target attributes
+        deepar_features = [
+            'geo_grid_auto', 'AP_bucket', 'stay_bucket', 'rating_bucket', 
+            'chain_bucket', 'rating_loc', 'rating_chain'
+        ]
+        
+        prepared_df = source_df_copy.groupby(['timestamp_hour'] + deepar_features).size().reset_index(name='demand')
 
-        # Interaction features
-        df_hourly['leadtime_x_recent'] = df_hourly['lead_time'] * df_hourly['lag_1h']
-        df_hourly['recent_and_close'] = (
-            (df_hourly['lag_1h'] > 0) & (df_hourly['lead_time'] <= 1)
-        ).astype(int)
-
-        # Lead time bucket
-        df_hourly['lead_time_bucket'] = pd.cut(
-            df_hourly['lead_time'],
-            bins=[-1, 1, 3, 7, 30, 365],
-            labels=['same_day', 'short', 'mid', 'long', 'very_long'],
-        )
-        df_hourly['lead_time_bucket'] = (
-            df_hourly['lead_time_bucket'].astype('object').fillna('very_long').astype('category')
-        )
-
-        # Target-aligned bookkeeping
-        df_hourly['next_hour_request_count'] = (
-            df_hourly.groupby('cache_key')['request_count'].shift(-1).fillna(0)
-        )
-
-        return df_hourly
+        return prepared_df.sort_values('timestamp_hour').reset_index(drop=True)

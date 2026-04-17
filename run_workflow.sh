@@ -6,23 +6,31 @@
 set -e
 
 # Default values
-PARTITION_DATE="2026-02-07"
-MAX_REQUESTS=10000000
+START_DATE="2026-02-07"
+END_DATE="2026-02-07"
+MAX_REQUESTS=100000000
 OUTPUT_PATH="workflow_ttl_methods_eval_$(date +%Y-%m-%d_%H%M%S).txt"
-CONTROLLED_CAPACITY=100
-UNCONTROLLED_CAPACITY=900
+CONTROLLED_CAPACITY=20000
+UNCONTROLLED_CAPACITY=180000
+LRU_CAPACITY=200000
 SCORE_PERCENTILE=0.7
 PREFETCH_RATIO=0.2
-ENABLE_BACKGROUND_REFRESH=false
-ADMISSION_SCORE_SOURCE="p_reuse"
-MIDAS_W_DEMAND=0.8
-MIDAS_W_MARKOV=0.2
+
 
 # Parse command line arguments
 while [[ $# -gt 0 ]]; do
     case $1 in
+        --start-date)
+            START_DATE="$2"
+            shift 2
+            ;;
+        --end-date)
+            END_DATE="$2"
+            shift 2
+            ;;
         --partition-date)
-            PARTITION_DATE="$2"
+            START_DATE="$2"
+            END_DATE="$2"
             shift 2
             ;;
         --max-requests)
@@ -41,6 +49,10 @@ while [[ $# -gt 0 ]]; do
             UNCONTROLLED_CAPACITY="$2"
             shift 2
             ;;
+        --lru-capacity)
+            LRU_CAPACITY="$2"
+            shift 2
+            ;;
         --score-percentile)
             SCORE_PERCENTILE="$2"
             shift 2
@@ -49,37 +61,20 @@ while [[ $# -gt 0 ]]; do
             PREFETCH_RATIO="$2"
             shift 2
             ;;
-        --enable-background-refresh)
-            ENABLE_BACKGROUND_REFRESH=true
-            shift
-            ;;
-        --admission-score-source)
-            ADMISSION_SCORE_SOURCE="$2"
-            shift 2
-            ;;
-        --midas-w-demand)
-            MIDAS_W_DEMAND="$2"
-            shift 2
-            ;;
-        --midas-w-markov)
-            MIDAS_W_MARKOV="$2"
-            shift 2
-            ;;
         --help)
             echo "Usage: ./run_workflow.sh [options]"
             echo ""
             echo "Options:"
-            echo "  --partition-date DATE              Partition date (default: 2026-02-07)"
+            echo "  --start-date DATE                  Start date (default: 2026-02-07)"
+            echo "  --end-date DATE                    End date (default: 2026-02-07)"
+            echo "  --partition-date DATE              Backward-compatible alias for single-day run"
             echo "  --max-requests NUM                 Max requests to sample (default: 10000000)"
             echo "  --output-path PATH                 Output file path (default: workflow_ttl_methods_eval_TIMESTAMP.txt)"
             echo "  --controlled-capacity NUM          Controlled cache capacity (default: 100)"
             echo "  --uncontrolled-capacity NUM        Uncontrolled cache capacity (default: 900)"
+            echo "  --lru-capacity NUM                 LRU baseline capacity (default: 1000)"
             echo "  --score-percentile FLOAT           Score percentile (default: 0.7)"
             echo "  --prefetch-ratio FLOAT             Prefetch ratio (default: 0.2)"
-            echo "  --enable-background-refresh        Enable background refresh flag"
-            echo "  --admission-score-source SOURCE    Admission score source: p_reuse|midas"
-            echo "  --midas-w-demand FLOAT             MIDAS demand weight (default: 0.8)"
-            echo "  --midas-w-markov FLOAT             MIDAS markov weight (default: 0.2)"
             echo "  --help                             Show this help message"
             echo ""
             echo "Examples:"
@@ -92,8 +87,8 @@ while [[ $# -gt 0 ]]; do
             echo "  # Run with specific partition date and request limit"
             echo "  ./run_workflow.sh --partition-date 2026-02-07 --max-requests 5000 --output-path my_result.txt"
             echo ""
-            echo "  # Run with background refresh enabled"
-            echo "  ./run_workflow.sh --enable-background-refresh"
+            echo "  # Run with a date range"
+            echo "  ./run_workflow.sh --start-date 2026-02-06 --end-date 2026-02-07 --max-requests 3000"
             exit 0
             ;;
         *)
@@ -104,44 +99,52 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# Build the Python command
-PYTHON_CMD="python Cache_System_Workflow/cache_pipeline.py"
-PYTHON_CMD="$PYTHON_CMD --partition-date $PARTITION_DATE"
-PYTHON_CMD="$PYTHON_CMD --max-requests $MAX_REQUESTS"
-PYTHON_CMD="$PYTHON_CMD --output-path $OUTPUT_PATH"
-PYTHON_CMD="$PYTHON_CMD --controlled-capacity $CONTROLLED_CAPACITY"
-PYTHON_CMD="$PYTHON_CMD --uncontrolled-capacity $UNCONTROLLED_CAPACITY"
-PYTHON_CMD="$PYTHON_CMD --score-percentile $SCORE_PERCENTILE"
-PYTHON_CMD="$PYTHON_CMD --prefetch-ratio $PREFETCH_RATIO"
-PYTHON_CMD="$PYTHON_CMD --admission-score-source $ADMISSION_SCORE_SOURCE"
-PYTHON_CMD="$PYTHON_CMD --midas-w-demand $MIDAS_W_DEMAND"
-PYTHON_CMD="$PYTHON_CMD --midas-w-markov $MIDAS_W_MARKOV"
-
-if [ "$ENABLE_BACKGROUND_REFRESH" = true ]; then
-    PYTHON_CMD="$PYTHON_CMD --enable-background-refresh"
+# Prefer the project virtualenv interpreter to avoid conda/site-package conflicts.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+VENV_PYTHON="$SCRIPT_DIR/.venv/bin/python"
+if [ -x "$VENV_PYTHON" ]; then
+    PYTHON_BIN="$VENV_PYTHON"
+elif command -v python3 >/dev/null 2>&1; then
+    PYTHON_BIN="python3"
+else
+    PYTHON_BIN="python"
 fi
+
+# Build the Python command as an argument array (safer than eval).
+PYTHON_CMD=(
+    "$PYTHON_BIN" "Cache_System_Workflow/cache_pipeline.py"
+    --start-date "$START_DATE"
+    --end-date "$END_DATE"
+    --max-requests "$MAX_REQUESTS"
+    --output-path "$OUTPUT_PATH"
+    --controlled-capacity "$CONTROLLED_CAPACITY"
+    --uncontrolled-capacity "$UNCONTROLLED_CAPACITY"
+    --lru-capacity "$LRU_CAPACITY"
+    --score-percentile "$SCORE_PERCENTILE"
+    --prefetch-ratio "$PREFETCH_RATIO"
+)
+
 
 # Print configuration
 echo "=========================================="
 echo "TTL Method Evaluation Workflow"
 echo "=========================================="
-echo "Partition Date:           $PARTITION_DATE"
+echo "Start Date:               $START_DATE"
+echo "End Date:                 $END_DATE"
 echo "Max Requests:             $MAX_REQUESTS"
 echo "Output Path:              $OUTPUT_PATH"
 echo "Controlled Capacity:      $CONTROLLED_CAPACITY"
 echo "Uncontrolled Capacity:    $UNCONTROLLED_CAPACITY"
+echo "LRU Capacity:             $LRU_CAPACITY"
 echo "Score Percentile:         $SCORE_PERCENTILE"
 echo "Prefetch Ratio:           $PREFETCH_RATIO"
-echo "Background Refresh:       $ENABLE_BACKGROUND_REFRESH"
-echo "Admission Score Source:   $ADMISSION_SCORE_SOURCE"
-echo "MIDAS W Demand:           $MIDAS_W_DEMAND"
-echo "MIDAS W Markov:           $MIDAS_W_MARKOV"
+echo "Python Interpreter:       $PYTHON_BIN"
 echo "=========================================="
 echo ""
 
 # Run the workflow
 echo "Starting workflow execution..."
-eval $PYTHON_CMD
+"${PYTHON_CMD[@]}"
 
 echo ""
 echo "=========================================="

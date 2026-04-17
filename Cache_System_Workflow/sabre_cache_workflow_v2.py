@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from bisect import bisect_right
 from collections import OrderedDict, deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -57,6 +58,7 @@ class RequestContext:
     city_code: str
     lead_time_days: Optional[int] = None
     cache_key_value: Optional[str] = None
+    hotel_code: Optional[str] = None
 
     def cache_key(self) -> str:
         """
@@ -65,6 +67,8 @@ class RequestContext:
         """
         if self.cache_key_value:
             return self.cache_key_value
+        if self.hotel_code is None:
+            raise ValueError("hotel_code is required when cache_key_value is not provided")
         return (
             f"{self.hotel_code}::"
             f"{self.city_code}::"
@@ -72,6 +76,33 @@ class RequestContext:
             f"{self.stay_end_date}"
         )
 
+@dataclass
+class TruthPriceProvider:
+    def __init__(self, truth_price_by_key: Dict[str, Dict[str, List[Any]]]) -> None:
+        self.calls = 0
+        self.truth_price_by_key = truth_price_by_key
+
+    def __call__(self, request: RequestContext) -> Dict[str, Any]:
+        self.calls += 1
+        key = request.cache_key()
+
+        series = self.truth_price_by_key.get(key)
+        offers: List[Dict[str, Any]] = []
+        if series is not None:
+            timestamps = series.get("timestamps", [])
+            offers_by_timestamp = series.get("offers", [])
+            request_ts = request.rq_timestamp
+            if request_ts.tzinfo is None:
+                request_ts = request_ts.replace(tzinfo=timezone.utc)
+
+            closest_idx = bisect_right(timestamps, request_ts) - 1
+            if 0 <= closest_idx < len(offers_by_timestamp):
+                offers = offers_by_timestamp[closest_idx]
+
+        return {
+            "request_key": key,
+            "offers": offers,
+        }
 
 @dataclass
 class CacheEntry:
@@ -95,6 +126,7 @@ class WorkflowResult:
     tier: str
     admission_score: float
     theta: float
+    evicted_key: str | None = None
 
 
 @dataclass(frozen=True)
@@ -102,11 +134,6 @@ class PreparedWorkflowInput:
     request: RequestContext
     p_reuse: float
     lambda_i: float
-
-
-class DataProvider(Protocol):
-    def __call__(self, request: RequestContext) -> Any:
-        ...
 
 
 class SabreCacheWorkflow:
@@ -159,11 +186,9 @@ class SabreCacheWorkflow:
         uncontrolled_ttl_lookup_by_lead_time: Optional[List[Tuple[int, int, int]]] = None,
         staleness_threshold: float = 0.01,
         max_cache_size_mb: float = 60.0,
-        avg_entry_size_bytes: int = 500,
+        avg_entry_size_bytes: int = 1000,
         min_cache_util_fraction: float = 0.20,
         prefetch_ratio: float = 0.01,
-        refresh_interval_seconds: int = 60,
-        enable_background_refresh: bool = True,
         now_fn: Callable[[], datetime] = _utc_now,
     ) -> None:
         self.controlled_capacity = controlled_capacity
@@ -190,38 +215,51 @@ class SabreCacheWorkflow:
         self.min_cache_util_fraction = _clamp_01(min_cache_util_fraction)
         self.min_cache_util_mb = self.max_cache_size_mb * self.min_cache_util_fraction
         self.prefetch_ratio = prefetch_ratio
-        self.refresh_interval_seconds = refresh_interval_seconds
-        self.enable_background_refresh = enable_background_refresh
         self._now_fn = now_fn
-        self._refresh_provider: Optional[DataProvider] = None
+        self._refresh_provider: Optional[TruthPriceProvider] = None
         self._lock = threading.RLock()
-        self._stop_event = threading.Event()
         self._controlled: OrderedDict[str, CacheEntry] = OrderedDict()
         self._controlled_min_heap: List[Tuple[float, str]] = []
         self._uncontrolled: OrderedDict[str, CacheEntry] = OrderedDict()
         self._score_history: Deque[float] = deque(maxlen=score_history_size)
         self._theta: float = 0.0
-        self._maintenance_thread: Optional[threading.Thread] = None
+        self._provider_call_counts: Dict[str, int] = {"refresh": 0, "prefetch": 0, "miss": 0}
+        self._last_stay_date_purge_date: Optional[str] = None
 
-        if self.enable_background_refresh:
-            self._maintenance_thread = threading.Thread(
-                target=self._maintenance_loop,
-                name="sabre-cache-maintenance",
-                daemon=True,
-            )
-            self._maintenance_thread.start()
 
-    def _is_valid_entry(self, entry: CacheEntry, now: datetime) -> bool:
+    def _is_stay_date_expired(self, entry: CacheEntry, now: datetime) -> bool:
+        """Check if the stay start date has passed."""
         stay_start = _parse_yyyy_mm_dd(entry.request.stay_start_date)
         if stay_start is not None and now.date() > stay_start.date():
-            return False
-        return entry.expires_at > now
+            return True
+        return False
 
-    def _maintenance_loop(self) -> None:
-        while not self._stop_event.wait(self.refresh_interval_seconds):
-            sweep_now = self._now_fn()
-            self._refresh_controlled_entries(sweep_now)
-            self._purge_expired_entries(sweep_now)
+    def _is_ttl_expired(self, entry: CacheEntry, now: datetime) -> bool:
+        """Check if the TTL has expired."""
+        return entry.expires_at <= now
+
+    def _purge_stay_date_expired_entries(self, now: datetime) -> None:
+        """Purge entries with expired stay_start_date (once per day)."""
+        today = now.date().isoformat()
+        
+        # Only run once per day
+        if self._last_stay_date_purge_date == today:
+            return
+        
+        with self._lock:
+            # Purge controlled entries
+            controlled_keys = [key for key, entry in self._controlled.items() 
+                             if self._is_stay_date_expired(entry, now)]
+            for key in controlled_keys:
+                del self._controlled[key]
+            
+            # Purge uncontrolled entries
+            uncontrolled_keys = [key for key, entry in self._uncontrolled.items() 
+                               if self._is_stay_date_expired(entry, now)]
+            for key in uncontrolled_keys:
+                del self._uncontrolled[key]
+        
+        self._last_stay_date_purge_date = today
 
     def _compute_score(self, p_reuse: float, lambda_i: float) -> float:
         safe_lambda = max(float(lambda_i), self.score_lambda_floor)
@@ -338,43 +376,35 @@ class SabreCacheWorkflow:
         entry.last_access_time = now
         entry.recent_freq += 1
 
-    def _purge_expired_entries(self, now: datetime) -> None:
+    def _record_provider_call(self, kind: str) -> None:
         with self._lock:
-            controlled_keys = [key for key, entry in self._controlled.items() if not self._is_valid_entry(entry, now)]
-            for key in controlled_keys:
-                del self._controlled[key]
+            self._provider_call_counts[kind] = self._provider_call_counts.get(kind, 0) + 1
 
-            uncontrolled_keys = [key for key, entry in self._uncontrolled.items() if not self._is_valid_entry(entry, now)]
-            for key in uncontrolled_keys:
-                del self._uncontrolled[key]
+    def provider_call_counts(self) -> Dict[str, int]:
+        with self._lock:
+            return dict(self._provider_call_counts)
 
-    def _refresh_controlled_entries(self, now: datetime) -> None:
+    def _refresh_controlled_entries(self, entry: CacheEntry, key: str, now: datetime) -> None:
         provider = self._refresh_provider
         if provider is None:
             return
 
-        with self._lock:
-            for key, entry in list(self._controlled.items()):
-                if not self._is_valid_entry(entry, now):
-                    del self._controlled[key]
-                    continue
-
-                payload = provider(entry.request)
-                entry.payload = payload
-                entry.expires_at = now + timedelta(
-                    seconds=self._compute_controlled_ttl(entry.request, entry.lambda_i, now)
-                )
-                self._touch_entry(entry, now)
-                self._controlled.move_to_end(key)
+        self._record_provider_call("refresh")
+        payload = provider(entry.request)
+        entry.payload = payload
+        entry.expires_at = now + timedelta(
+            seconds=self._compute_controlled_ttl(entry.request, entry.lambda_i, now)
+        )
 
     def _get_from_controlled(self, key: str, now: datetime) -> Optional[CacheEntry]:
         with self._lock:
             entry = self._controlled.get(key)
             if entry is None:
                 return None
-            if not self._is_valid_entry(entry, now):
-                del self._controlled[key]
-                return None
+            # If TTL has expired, try to refresh on-hit
+            if self._is_ttl_expired(entry, now):
+                self._refresh_controlled_entries(entry, key, now)
+
             self._touch_entry(entry, now)
             self._controlled.move_to_end(key)
             return entry
@@ -384,30 +414,27 @@ class SabreCacheWorkflow:
             entry = self._uncontrolled.get(key)
             if entry is None:
                 return None
-            if not self._is_valid_entry(entry, now):
-                del self._uncontrolled[key]
-                return None
             self._touch_entry(entry, now)
             self._uncontrolled.move_to_end(key)
             return entry
 
-    def _admit_to_controlled(self, key: str, entry: CacheEntry) -> bool:
+    def _admit_to_controlled(self, key: str, entry: CacheEntry) -> Tuple[bool, str | None]:
         with self._lock:
             if self.controlled_capacity <= 0:
-                return False
+                return False, None
 
             # Safety path: if the key already exists, update in-place.
             if key in self._controlled:
                 self._controlled[key] = entry
                 self._controlled.move_to_end(key)
                 heapq.heappush(self._controlled_min_heap, (entry.score, key))
-                return True
+                return True, None
 
             if len(self._controlled) < self.controlled_capacity:
                 self._controlled[key] = entry
                 self._controlled.move_to_end(key)
                 heapq.heappush(self._controlled_min_heap, (entry.score, key))
-                return True
+                return True, None
 
             while self._controlled_min_heap:
                 min_score, min_key = self._controlled_min_heap[0]
@@ -421,45 +448,51 @@ class SabreCacheWorkflow:
                 self._controlled[key] = entry
                 self._controlled.move_to_end(key)
                 heapq.heappush(self._controlled_min_heap, (entry.score, key))
-                return True
+                return True, None
 
             min_score, min_key = self._controlled_min_heap[0]
             if entry.score <= min_score:
-                return False
+                return False, None
 
             heapq.heappop(self._controlled_min_heap)
             del self._controlled[min_key]
             self._controlled[key] = entry
             self._controlled.move_to_end(key)
             heapq.heappush(self._controlled_min_heap, (entry.score, key))
-            return True
+            return True, min_key
 
-    def _admit_to_uncontrolled(self, key: str, entry: CacheEntry) -> bool:
+    def _admit_to_uncontrolled(self, key: str, entry: CacheEntry) -> Tuple[bool, str | None]:
         with self._lock:
             if self.uncontrolled_capacity <= 0:
-                return False
+                return False, None
 
             if key in self._uncontrolled:
                 self._uncontrolled[key] = entry
                 self._uncontrolled.move_to_end(key)
-                return True
+                return True, None
+
+            evicted_key: str | None = None
 
             if len(self._uncontrolled) >= self.uncontrolled_capacity:
-                self._uncontrolled.popitem(last=False)
+                evicted_key, _ = self._uncontrolled.popitem(last=False)
 
             self._uncontrolled[key] = entry
             self._uncontrolled.move_to_end(key)
-            return True
+            return True, evicted_key
 
     def get(
         self,
         request: RequestContext,
         p_reuse: float,
         lambda_i: float,
-        provider: DataProvider,
+        provider: TruthPriceProvider,
     ) -> WorkflowResult:
         self._refresh_provider = provider
         request_now = request.rq_timestamp
+        
+        # Purge stay-date expired entries if date has changed
+        self._purge_stay_date_expired_entries(request_now)
+        
         key = request.cache_key()
         score = self._compute_score(p_reuse, lambda_i)
         theta = self._update_theta(score)
@@ -488,6 +521,7 @@ class SabreCacheWorkflow:
                 theta=theta,
             )
 
+        self._record_provider_call("miss")
         payload = provider(request)
         controlled_ttl = self._compute_controlled_ttl(request, lambda_i, request_now)
         uncontrolled_ttl = self._compute_uncontrolled_ttl(request, lambda_i, request_now)
@@ -515,18 +549,21 @@ class SabreCacheWorkflow:
             age_seconds=0.0,
         )
 
-        if score >= theta and self._admit_to_controlled(key, controlled_entry):
-            return WorkflowResult(
-                key=key,
-                source="miss_admit_controlled",
-                payload=payload,
-                cached=True,
-                tier="controlled",
-                admission_score=score,
-                theta=theta,
-            )
+        if score >= theta:
+            admitted_controlled, evicted_controlled_key = self._admit_to_controlled(key, controlled_entry)
+            if admitted_controlled:
+                return WorkflowResult(
+                    key=key,
+                    source="miss_admit_controlled",
+                    payload=payload,
+                    cached=True,
+                    tier="controlled",
+                    admission_score=score,
+                    theta=theta,
+                    evicted_key=evicted_controlled_key,
+                )
 
-        self._admit_to_uncontrolled(key, uncontrolled_entry)
+        _, evicted_uncontrolled_key = self._admit_to_uncontrolled(key, uncontrolled_entry)
 
         return WorkflowResult(
             key=key,
@@ -536,34 +573,13 @@ class SabreCacheWorkflow:
             tier="uncontrolled",
             admission_score=score,
             theta=theta,
+            evicted_key=evicted_uncontrolled_key,
         )
-
-    def run_prepared_requests(
-        self,
-        prepared_requests: List[PreparedWorkflowInput],
-        provider: DataProvider,
-    ) -> List[WorkflowResult]:
-        """Run cache workflow on upstream-prepared request records.
-
-        This is the integration point for data_pipeline.ipynb, model_input.py,
-        and lambda_model.py: the caller prepares RequestContext, p_reuse, and
-        lambda_i before invoking the workflow.
-        """
-        results: List[WorkflowResult] = []
-        for item in prepared_requests:
-            result = self.get(
-                request=item.request,
-                p_reuse=item.p_reuse,
-                lambda_i=item.lambda_i,
-                provider=provider,
-            )
-            results.append(result)
-        return results
 
     def prefetch_controlled(
         self,
         candidates: List[Tuple[RequestContext, float, float]],
-        provider: DataProvider,
+        provider: TruthPriceProvider,
     ) -> List[str]:
         """
         Prefetch top-k p_reuse requests into controlled cache when keys are not cached.
@@ -589,6 +605,7 @@ class SabreCacheWorkflow:
         admitted_keys: List[str] = []
         for request, p_reuse, lambda_i in selected:
             key = request.cache_key()
+            self._record_provider_call("prefetch")
             payload = provider(request)
             ttl = self._compute_controlled_ttl(request, lambda_i, request.rq_timestamp)
             entry = CacheEntry(
@@ -602,7 +619,8 @@ class SabreCacheWorkflow:
                 last_access_time=request.rq_timestamp,
                 age_seconds=0.0,
             )
-            if self._admit_to_controlled(key, entry):
+            admitted, _ = self._admit_to_controlled(key, entry)
+            if admitted:
                 admitted_keys.append(key)
 
         return admitted_keys
@@ -619,12 +637,6 @@ class SabreCacheWorkflow:
             self._uncontrolled.clear()
             self._score_history.clear()
             self._theta = 0.0
-
-    def close(self) -> None:
-        self._stop_event.set()
-        thread = self._maintenance_thread
-        if thread is not None and thread.is_alive():
-            thread.join(timeout=2.0)
 
     def _count_valid(self, store: Dict[str, CacheEntry] | OrderedDict[str, CacheEntry]) -> int:
         now = self._now_fn()
@@ -658,6 +670,7 @@ if __name__ == "__main__":
         stay_end_date="2026-05-03",
         duration=2,
         city_code="DFW",
+        hotel_code="H100",
     )
 
     def fake_provider(r: RequestContext) -> Dict[str, Any]:
@@ -676,12 +689,12 @@ if __name__ == "__main__":
     prefetch_keys = workflow.prefetch_controlled(
         candidates=[
             (
-                RequestContext(_utc_now(), "HY", "2026-06-01", "2026-06-02", 1, "NYC"),
+                RequestContext(_utc_now(), "HY", "2026-06-01", "2026-06-02", 1, "NYC", hotel_code="H101"),
                 0.95,
                 0.90,
             ),
             (
-                RequestContext(_utc_now(), "MC", "2026-06-05", "2026-06-07", 2, "DFW"),
+                RequestContext(_utc_now(), "MC", "2026-06-05", "2026-06-07", 2, "DFW", hotel_code="H102"),
                 0.77,
                 0.65,
             ),

@@ -29,12 +29,10 @@ env/
 *.log
 
 # Generated evaluation and simulation outputs
-workflow_ttl_methods_eval_*.txt
-distribution_summary.txt
+*.txt
 distribution_testing.py
 distribution_analysis.png
-*_smoke*.txt
-simulation_output_*.txt
+demand_forecast_distribution_test.py
 
 # Optional: large local datasets (uncomment if needed)
 data/cleaned_partitioned/
