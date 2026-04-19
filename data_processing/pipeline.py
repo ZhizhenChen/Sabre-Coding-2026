@@ -18,6 +18,157 @@ from demand_forecasting.feature_rules import (
 )
 
 
+LAMBDA_REQUIRED_COLUMNS = [
+    "rq_timestamp",
+    "hotel_code",
+    "lead_time",
+    "duration",
+    "rate_source",
+    "price_change",
+]
+
+
+def lambda_bucket_lead_time(horizon: int) -> str:
+    """Map lead_time_days to a lambda-model bucket label."""
+    h = int(horizon)
+    if h == 0:
+        return "same_day"
+    if 1 <= h <= 3:
+        return "1_to_3d"
+    if 4 <= h <= 7:
+        return "4_to_7d"
+    if 8 <= h <= 14:
+        return "8_to_14d"
+    if 15 <= h <= 30:
+        return "15_to_30d"
+    if 31 <= h <= 90:
+        return "31_to_90d"
+    return "91plus"
+
+
+def lambda_bucket_duration(duration: int) -> str:
+    """Map stay duration (nights) to a lambda-model bucket label."""
+    d = int(duration)
+    if d == 1:
+        return "1_night"
+    if d == 2:
+        return "2_nights"
+    if d == 3:
+        return "3_nights"
+    if 4 <= d <= 5:
+        return "4_to_5n"
+    if 6 <= d <= 7:
+        return "6_to_7n"
+    if 8 <= d <= 14:
+        return "8_to_14n"
+    return "15plus"
+
+
+def lambda_encode_hotel(df: pd.DataFrame, min_count: int = 4) -> pd.Series:
+    """Sparse-hotel encoding for lambda modeling."""
+    if "hotel_code" not in df.columns:
+        raise ValueError("df must have 'hotel_code' column")
+
+    counts = df["hotel_code"].value_counts()
+    encoded = df["hotel_code"].apply(lambda code: "rare_hotel" if counts.get(code, 0) < min_count else code)
+    encoded.name = "hotel_encoded"
+    return encoded
+
+
+def prepare_lambda_enriched_dataframe(df_enriched: pd.DataFrame, min_hotel_count: int = 4) -> pd.DataFrame:
+    """
+    Shared lambda-model preprocessing:
+    - validate required columns
+    - remove invalid lead_time/duration
+    - add lead_time_bucket, duration_bucket, hotel_encoded
+    """
+    missing = [c for c in LAMBDA_REQUIRED_COLUMNS if c not in df_enriched.columns]
+    if missing:
+        raise ValueError(f"df_enriched missing required columns: {missing}")
+
+    df = df_enriched.copy()
+    df = df[df["lead_time"] >= 0].copy()
+    df = df[df["duration"] > 0].copy()
+    if df.empty:
+        return df
+
+    df["lead_time_bucket"] = df["lead_time"].apply(lambda_bucket_lead_time)
+    df["duration_bucket"] = df["duration"].apply(lambda_bucket_duration)
+    df["hotel_encoded"] = lambda_encode_hotel(df, min_count=min_hotel_count)
+    df["price_change"] = pd.to_numeric(df["price_change"], errors="coerce").fillna(0).astype(int)
+    return df
+
+
+def aggregate_lambda_bucket_groups(
+    df_prepared: pd.DataFrame,
+    ttl_numerator_target_80: float,
+) -> pd.DataFrame:
+    """
+    Aggregate lambda features by
+    (hotel_encoded, duration_bucket, lead_time_bucket, rate_source).
+    """
+    if df_prepared.empty:
+        return pd.DataFrame()
+
+    group_cols = ["hotel_encoded", "duration_bucket", "lead_time_bucket", "rate_source"]
+    sorted_df = df_prepared.sort_values(group_cols + ["rq_timestamp"]).copy()
+    sorted_df["delta_hours"] = sorted_df.groupby(group_cols)["rq_timestamp"].diff().dt.total_seconds() / 3600.0
+
+    interval_df = sorted_df[sorted_df["delta_hours"] > 0].copy()
+    if interval_df.empty:
+        return pd.DataFrame()
+
+    group_agg = (
+        interval_df.groupby(group_cols, dropna=False, sort=False)
+        .agg(
+            n_intervals=("delta_hours", "size"),
+            total_changes=("price_change", "sum"),
+            total_exposure_hours=("delta_hours", "sum"),
+        )
+        .reset_index()
+    )
+    group_agg["total_changes"] = group_agg["total_changes"].astype(int)
+    group_agg["n_events"] = group_agg["total_changes"]
+    group_agg["total_exposure_hours"] = pd.to_numeric(group_agg["total_exposure_hours"], errors="coerce")
+    exposure_for_div = group_agg["total_exposure_hours"].where(group_agg["total_exposure_hours"] > 0, np.nan)
+    group_agg["lambda_poisson"] = group_agg["total_changes"] / exposure_for_div
+    group_agg["implied_ttl_poisson_hours"] = ttl_numerator_target_80 / group_agg["lambda_poisson"]
+    group_agg["implied_ttl_hours"] = group_agg["implied_ttl_poisson_hours"]
+    return group_agg
+
+
+def split_lambda_prepared_by_time(
+    df_prepared: pd.DataFrame,
+    train_ratio: float = 0.8,
+) -> Tuple[pd.DataFrame, pd.DataFrame, Optional[pd.Timestamp]]:
+    """
+    Time-based split on rq_timestamp.
+    Returns (train_df, test_df, split_ts).
+    """
+    if df_prepared.empty:
+        return df_prepared.copy(), df_prepared.copy(), None
+
+    df = df_prepared.copy()
+    df["rq_timestamp"] = pd.to_datetime(df["rq_timestamp"], errors="coerce", utc=True)
+    df = df.dropna(subset=["rq_timestamp"]).sort_values("rq_timestamp")
+    if df.empty:
+        return df, df.copy(), None
+
+    ratio = float(min(max(train_ratio, 0.5), 0.99))
+    split_ts = pd.Timestamp(df["rq_timestamp"].quantile(ratio))
+
+    train_df = df[df["rq_timestamp"] <= split_ts].copy()
+    test_df = df[df["rq_timestamp"] > split_ts].copy()
+
+    if train_df.empty or test_df.empty:
+        cut = max(1, min(len(df) - 1, int(len(df) * ratio)))
+        train_df = df.iloc[:cut].copy()
+        test_df = df.iloc[cut:].copy()
+        split_ts = pd.Timestamp(train_df["rq_timestamp"].max()) if not train_df.empty else None
+
+    return train_df, test_df, split_ts
+
+
 class DataPipelineProcessor:
     """
     Loads cleaned_partitioned data by date and produces:
