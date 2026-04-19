@@ -120,6 +120,67 @@ def _build_method_block(method: str, table: pd.DataFrame, split_label: str = "al
     return "\n".join(lines)
 
 
+def _build_lambda_diagnostic_block(method: str, table: pd.DataFrame, split_label: str) -> str:
+    lines: list[str] = []
+    lines.append("=" * 100)
+    lines.append(f"LAMBDA DIAGNOSTIC: {method} (split={split_label})")
+    lines.append("=" * 100)
+
+    lam = pd.to_numeric(table.get("lambda_final"), errors="coerce")
+    lam = lam[np.isfinite(lam) & (lam > 0)]
+    n = int(len(lam))
+    lines.append(f"n_valid_lambda: {n}")
+    if n == 0:
+        lines.append("No valid lambda values for diagnostics.")
+        lines.append("")
+        return "\n".join(lines)
+
+    p99 = float(lam.quantile(0.99))
+    p999 = float(lam.quantile(0.999))
+    p95 = float(lam.quantile(0.95))
+    std_raw = float(lam.std(ddof=1)) if n > 1 else 0.0
+    std_clip_p99 = float(lam.clip(upper=p99).std(ddof=1)) if n > 1 else 0.0
+    std_clip_p999 = float(lam.clip(upper=p999).std(ddof=1)) if n > 1 else 0.0
+    mean_raw = float(lam.mean())
+    median_raw = float(lam.median())
+
+    lines.append(f"lambda_mean: {mean_raw:.8f}")
+    lines.append(f"lambda_median: {median_raw:.8f}")
+    lines.append(f"lambda_std_raw: {std_raw:.8f}")
+    lines.append(f"lambda_std_clip_p99: {std_clip_p99:.8f}")
+    lines.append(f"lambda_std_clip_p999: {std_clip_p999:.8f}")
+    lines.append(f"lambda_p95: {p95:.8f}")
+    lines.append(f"lambda_p99: {p99:.8f}")
+    lines.append(f"lambda_p999: {p999:.8f}")
+    lines.append(f"share_lambda_gt_1: {float((lam > 1).mean()):.6f}")
+    lines.append(f"share_lambda_gt_10: {float((lam > 10).mean()):.6f}")
+    lines.append(f"share_lambda_gt_100: {float((lam > 100).mean()):.6f}")
+
+    if "_in_lookup" in table.columns:
+        in_lookup = table["_in_lookup"].astype(bool)
+        lines.append(f"lookup_eligible_ratio(_in_lookup=True): {float(in_lookup.mean()):.6f}")
+
+    if "_global_lambda" in table.columns:
+        global_col = pd.to_numeric(table["_global_lambda"], errors="coerce")
+        pair = pd.DataFrame({"lam": pd.to_numeric(table.get("lambda_final"), errors="coerce"), "glob": global_col})
+        pair = pair[np.isfinite(pair["lam"]) & np.isfinite(pair["glob"])]
+        if not pair.empty:
+            # Treat values extremely close to global as global-fill rows.
+            near_global = np.isclose(pair["lam"], pair["glob"], rtol=1e-10, atol=1e-12)
+            lines.append(f"global_fill_ratio(lambda_final==global_lambda): {float(np.mean(near_global)):.6f}")
+
+    if method == "glm" and "lambda_glm" in table.columns:
+        glm_lam = pd.to_numeric(table["lambda_glm"], errors="coerce")
+        glm_valid = glm_lam[np.isfinite(glm_lam) & (glm_lam > 0)]
+        lines.append(f"glm_direct_valid_ratio(lambda_glm>0): {float(len(glm_valid) / max(len(table), 1)):.6f}")
+        if "lambda_method" in table.columns:
+            fallback_ratio = float(table["lambda_method"].astype(str).str.contains("fallback", case=False, na=False).mean())
+            lines.append(f"glm_fallback_row_ratio(lambda_method contains 'fallback'): {fallback_ratio:.6f}")
+
+    lines.append("")
+    return "\n".join(lines)
+
+
 def _build_accuracy_block(method: str, table: pd.DataFrame, split_label: str) -> str:
     lines: list[str] = []
     lines.append("=" * 100)
@@ -255,12 +316,15 @@ def build_report(
                     split_df = table[table["dataset_split"] == split_name].copy()
                     if not split_df.empty:
                         lines.append(_build_method_block(method, split_df, split_label=split_name))
+                        lines.append(_build_lambda_diagnostic_block(method, split_df, split_label=split_name))
                         lines.append(_build_accuracy_block(method, split_df, split_label=split_name))
             else:
                 lines.append(_build_method_block(method, table, split_label="all"))
+                lines.append(_build_lambda_diagnostic_block(method, table, split_label="all"))
                 lines.append(_build_accuracy_block(method, table, split_label="all"))
         else:
             lines.append(_build_method_block(method, table, split_label="all"))
+            lines.append(_build_lambda_diagnostic_block(method, table, split_label="all"))
             lines.append(_build_accuracy_block(method, table, split_label="all"))
 
     return "\n".join(lines).rstrip() + "\n"

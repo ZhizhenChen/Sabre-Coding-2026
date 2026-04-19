@@ -8,7 +8,7 @@ import hashlib
 import numpy as np
 import pandas as pd
 from pathlib import Path
-from typing import Tuple, Optional, List
+from typing import Tuple, Optional
 
 from demand_forecasting.feature_rules import (
     ap_bucket_label,
@@ -317,21 +317,8 @@ class DataPipelineProcessor:
         # Hour
         df['timestamp_hour'] = df['rq_timestamp'].dt.floor('h')
 
-        return df
 
-    def _cleanup_location_data(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Convert geolocation to numeric and drop invalid rows."""
-        df = df.copy()
-        df['location_latitude'] = pd.to_numeric(df['location_latitude'], errors='coerce')
-        df['location_longitude'] = pd.to_numeric(df['location_longitude'], errors='coerce')
-        df = df.dropna(subset=['location_latitude', 'location_longitude'])
-        return df
-
-    def _process_rates_and_prices(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Extract rate source and explode convertedrate_infos, compute price_per_day."""
-        df = df.copy()
-
-        # Rate group (hash of rate plan candidates)
+                # Rate group (hash of rate plan candidates)
         def make_rate_group(val):
             if pd.isna(val) or str(val).strip() in ('[]', '', 'nan'):
                 return 'NO_RATE'
@@ -349,6 +336,19 @@ class DataPipelineProcessor:
             rate_source_series = pd.Series(['NO_RATE'] * len(df), index=df.index)
 
         df['rate_group'] = rate_source_series.apply(make_rate_group)
+        return df
+
+    def _cleanup_location_data(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Convert geolocation to numeric and drop invalid rows."""
+        df = df.copy()
+        df['location_latitude'] = pd.to_numeric(df['location_latitude'], errors='coerce')
+        df['location_longitude'] = pd.to_numeric(df['location_longitude'], errors='coerce')
+        df = df.dropna(subset=['location_latitude', 'location_longitude'])
+        return df
+
+    def _process_rates_and_prices(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Extract rate source and explode convertedrate_infos, compute price_per_day."""
+        df = df.copy()
 
         # Explode convertedrate_infos
         df = df.explode('convertedrate_infos')
@@ -377,10 +377,7 @@ class DataPipelineProcessor:
     def _compute_market_and_price_change(self, df: pd.DataFrame) -> pd.DataFrame:
         """Compute market_key and price_change flag."""
         df = df.copy()
-        # df['market_key'] = (
-        #     df['location_latitude'].astype(str) + '_' +
-        #     df['location_longitude'].astype(str)
-        # )
+
         df = df.sort_values(['hotel_code', 'lead_time'])
         df['price_change'] = (
             df.groupby(['hotel_code', 'lead_time', 'rate_source'])['price_per_day']

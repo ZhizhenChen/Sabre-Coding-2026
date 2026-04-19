@@ -298,11 +298,7 @@ def _group_level_stats(df_enriched: pd.DataFrame) -> pd.DataFrame:
 
 def build_lambda_table_km(df_enriched: pd.DataFrame, min_intervals: int = 5) -> pd.DataFrame:
     """Kaplan-Meier based lambda estimation (legacy behavior — do NOT modify)."""
-    # NOTE: This function is not being updated. Kept as-is for backward compatibility.
-    # The specification says "Do not modify anything outside the two files listed above"
-    # and "Do not touch: build_lambda_table_km() and _build_km_ttl_lookup()"
-    # So this uses the old grouping. Only Poisson and GLM are being updated.
-    
+
     out = _group_level_stats(df_enriched)
     if out.empty:
         return out

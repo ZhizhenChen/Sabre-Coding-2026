@@ -102,6 +102,11 @@ class TruthPriceProvider:
         return {
             "request_key": key,
             "offers": offers,
+            "rate_group": (
+                offers[0].get("rate_group")
+                if offers and isinstance(offers[0], dict) and offers[0].get("rate_group") is not None
+                else None
+            ),
         }
 
 @dataclass
@@ -150,7 +155,7 @@ class SabreCacheWorkflow:
     - theta = top 80 percentile of recent scores
     - controlled cache: score-threshold admission + min-heap eviction by score
     - uncontrolled cache: LRU eviction
-    - controlled hits serve cached payload; refresh happens on miss/expiry (or background refresh)
+    - controlled/uncontrolled hits serve cached payload; refresh happens on expiry
 
     TTL behavior (ipynb-aligned):
     - freshness target: TTL = -ln(target_freshness) / lambda
@@ -396,6 +401,18 @@ class SabreCacheWorkflow:
             seconds=self._compute_controlled_ttl(entry.request, entry.lambda_i, now)
         )
 
+    def _refresh_uncontrolled_entries(self, entry: CacheEntry, key: str, now: datetime) -> None:
+        provider = self._refresh_provider
+        if provider is None:
+            return
+
+        self._record_provider_call("refresh")
+        payload = provider(entry.request)
+        entry.payload = payload
+        entry.expires_at = now + timedelta(
+            seconds=self._compute_uncontrolled_ttl(entry.request, entry.lambda_i, now)
+        )
+
     def _get_from_controlled(self, key: str, now: datetime) -> Optional[CacheEntry]:
         with self._lock:
             entry = self._controlled.get(key)
@@ -414,27 +431,30 @@ class SabreCacheWorkflow:
             entry = self._uncontrolled.get(key)
             if entry is None:
                 return None
+            # If TTL has expired, refresh on-hit using uncontrolled TTL.
+            if self._is_ttl_expired(entry, now):
+                self._refresh_uncontrolled_entries(entry, key, now)
             self._touch_entry(entry, now)
             self._uncontrolled.move_to_end(key)
             return entry
 
-    def _admit_to_controlled(self, key: str, entry: CacheEntry) -> Tuple[bool, str | None]:
+    def _admit_to_controlled(self, key: str, entry: CacheEntry) -> Tuple[bool, str | None, CacheEntry | None]:
         with self._lock:
             if self.controlled_capacity <= 0:
-                return False, None
+                return False, None, None
 
             # Safety path: if the key already exists, update in-place.
             if key in self._controlled:
                 self._controlled[key] = entry
                 self._controlled.move_to_end(key)
                 heapq.heappush(self._controlled_min_heap, (entry.score, key))
-                return True, None
+                return True, None, None
 
             if len(self._controlled) < self.controlled_capacity:
                 self._controlled[key] = entry
                 self._controlled.move_to_end(key)
                 heapq.heappush(self._controlled_min_heap, (entry.score, key))
-                return True, None
+                return True, None, None
 
             while self._controlled_min_heap:
                 min_score, min_key = self._controlled_min_heap[0]
@@ -448,18 +468,19 @@ class SabreCacheWorkflow:
                 self._controlled[key] = entry
                 self._controlled.move_to_end(key)
                 heapq.heappush(self._controlled_min_heap, (entry.score, key))
-                return True, None
+                return True, None, None
 
             min_score, min_key = self._controlled_min_heap[0]
             if entry.score <= min_score:
-                return False, None
+                return False, None, None
 
             heapq.heappop(self._controlled_min_heap)
+            evicted_entry = self._controlled[min_key]
             del self._controlled[min_key]
             self._controlled[key] = entry
             self._controlled.move_to_end(key)
             heapq.heappush(self._controlled_min_heap, (entry.score, key))
-            return True, min_key
+            return True, min_key, evicted_entry
 
     def _admit_to_uncontrolled(self, key: str, entry: CacheEntry) -> Tuple[bool, str | None]:
         with self._lock:
@@ -550,8 +571,15 @@ class SabreCacheWorkflow:
         )
 
         if score >= theta:
-            admitted_controlled, evicted_controlled_key = self._admit_to_controlled(key, controlled_entry)
+            admitted_controlled, evicted_controlled_key, evicted_controlled_entry = self._admit_to_controlled(key, controlled_entry)
             if admitted_controlled:
+                evicted_uncontrolled_key: str | None = None
+                # Demote controlled-evicted key into uncontrolled tier.
+                if evicted_controlled_key is not None and evicted_controlled_entry is not None:
+                    _, evicted_uncontrolled_key = self._admit_to_uncontrolled(
+                        evicted_controlled_key,
+                        evicted_controlled_entry,
+                    )
                 return WorkflowResult(
                     key=key,
                     source="miss_admit_controlled",
@@ -619,7 +647,7 @@ class SabreCacheWorkflow:
                 last_access_time=request.rq_timestamp,
                 age_seconds=0.0,
             )
-            admitted, _ = self._admit_to_controlled(key, entry)
+            admitted, _, _ = self._admit_to_controlled(key, entry)
             if admitted:
                 admitted_keys.append(key)
 

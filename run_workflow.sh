@@ -8,13 +8,13 @@ set -e
 # Default values
 START_DATE="2026-02-07"
 END_DATE="2026-02-07"
-MAX_REQUESTS=100000000
+MAX_REQUESTS=1000000
 OUTPUT_PATH="workflow_ttl_methods_eval_$(date +%Y-%m-%d_%H%M%S).txt"
-CONTROLLED_CAPACITY=20000
-UNCONTROLLED_CAPACITY=180000
-LRU_CAPACITY=200000
-SCORE_PERCENTILE=0.9
-PREFETCH_RATIO=0.1
+CONTROLLED_CAPACITY=10000
+UNCONTROLLED_CAPACITY=90000
+LRU_CAPACITY=100000
+SCORE_PERCENTILE=0.8
+PREFETCH_RATIO=0.3
 
 
 # Parse command line arguments
@@ -68,13 +68,13 @@ while [[ $# -gt 0 ]]; do
             echo "  --start-date DATE                  Start date (default: 2026-02-07)"
             echo "  --end-date DATE                    End date (default: 2026-02-07)"
             echo "  --partition-date DATE              Backward-compatible alias for single-day run"
-            echo "  --max-requests NUM                 Max requests to sample (default: 10000000)"
+            echo "  --max-requests NUM                 Max requests to sample (default: 100000000)"
             echo "  --output-path PATH                 Output file path (default: workflow_ttl_methods_eval_TIMESTAMP.txt)"
-            echo "  --controlled-capacity NUM          Controlled cache capacity (default: 100)"
-            echo "  --uncontrolled-capacity NUM        Uncontrolled cache capacity (default: 900)"
-            echo "  --lru-capacity NUM                 LRU baseline capacity (default: 1000)"
-            echo "  --score-percentile FLOAT           Score percentile (default: 0.7)"
-            echo "  --prefetch-ratio FLOAT             Prefetch ratio (default: 0.2)"
+            echo "  --controlled-capacity NUM          Controlled cache capacity (default: 20000)"
+            echo "  --uncontrolled-capacity NUM        Uncontrolled cache capacity (default: 180000)"
+            echo "  --lru-capacity NUM                 LRU baseline capacity (default: 200000)"
+            echo "  --score-percentile FLOAT           Score percentile (default: 0.9)"
+            echo "  --prefetch-ratio FLOAT             Prefetch ratio (default: 0.1)"
             echo "  --help                             Show this help message"
             echo ""
             echo "Examples:"
