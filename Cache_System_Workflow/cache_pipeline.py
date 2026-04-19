@@ -78,6 +78,8 @@ class LRUSummary:
     miss_count: int
     provider_calls: int
     hit_rate: float
+    stale_response_count: int
+    stale_rate_served_pct: float
     eviction_count: int
     eviction_accuracy: float
     wrong_eviction_count: int
@@ -496,6 +498,7 @@ def _run_lru_baseline(
 
     eviction_events: List[Tuple[str, int]] = []
     requests_by_key: Dict[str, List[int]] = defaultdict(list)
+    stale_response_count = 0
 
     for idx, row in enumerate(requests_df.itertuples(index=False), start=1):
         request = _request_context_from_row(row)
@@ -504,6 +507,11 @@ def _run_lru_baseline(
         result = lru.get(request, provider)
         if result.evicted_key is not None:
             eviction_events.append((result.evicted_key, idx))
+        if "hit" in result.source:
+            served_price = _extract_price(result.payload)
+            truth_price = _get_truth_price_for_request(key, request.rq_timestamp, truth_price_by_key)
+            if served_price is not None and truth_price is not None and abs(served_price - truth_price) / max(served_price, 1e-6) > 0.01:
+                stale_response_count += 1
 
     total_requests = len(requests_df)
     unique_keys = int(requests_df["cache_key"].nunique())
@@ -528,6 +536,8 @@ def _run_lru_baseline(
         miss_count=lru.misses,
         provider_calls=provider.calls,
         hit_rate=hit_rate,
+        stale_response_count=stale_response_count,
+        stale_rate_served_pct=stale_response_count / lru.hits if lru.hits else 0.0,
         eviction_count=eviction_count,
         eviction_accuracy=1- queried_after_eviction / eviction_count if eviction_count else 0.0,
         wrong_eviction_count=wrong_eviction_count,
@@ -623,6 +633,11 @@ def run_ttl_method_eval(
     lines.append(f"hit_count: {lru_summary.hit_count}")
     lines.append(f"miss_count: {lru_summary.miss_count}")
     lines.append(f"provider_total_calls: {lru_summary.provider_calls}")
+    lines.append(f"stale_rate_served_pct: {lru_summary.stale_rate_served_pct:.4f}")
+    lines.append(f"eviction_count: {lru_summary.eviction_count}")
+    lines.append(f"eviction_accuracy: {lru_summary.eviction_accuracy:.4f}")
+    lines.append(f"wrong_eviction_count: {lru_summary.wrong_eviction_count}")
+    lines.append(f"avg_query_count_after_eviction: {lru_summary.avg_query_count_after_eviction:.4f}")
     lines.append("")
 
     for summary in evals:
@@ -641,6 +656,7 @@ def run_ttl_method_eval(
         lines.append(f"prewarm_precision: {summary.prewarm_precision:.4f}")
         lines.append(f"eviction_count: {summary.eviction_count}")
         lines.append(f"eviction_accuracy: {summary.eviction_accuracy:.4f}")
+        lines.append(f"wrong_eviction_count: {summary.wrong_eviction_count}")
         lines.append(f"avg_query_count_after_eviction: {summary.avg_query_count_after_eviction:.4f}")
         lines.append("ttl_lookup_by_bucket:")
         lookup = ttl_lookups.get(summary.ttl_method, {})
