@@ -70,6 +70,7 @@ class EvalSummary:
     wrong_eviction_count: int
     avg_query_count_after_eviction: float
     api_call_reduction_pct_vs_lru: float
+    admission_scores: List[float]
 
 
 @dataclass
@@ -641,6 +642,7 @@ def _run_ttl_method(
     hit_count = 0
     miss_count = 0
     stale_response_count = 0
+    admission_scores: List[float] = []
     eviction_events: List[Tuple[str, int]] = []
     requests_by_key: Dict[str, List[int]] = defaultdict(list)
     hit_keys: set[str] = set()
@@ -650,6 +652,7 @@ def _run_ttl_method(
         key = request.cache_key()
         requests_by_key[key].append(idx)
         result = workflow.get(request, p_reuse=item.p_reuse, lambda_i=item.lambda_i, provider=provider)
+        admission_scores.append(float(result.admission_score))
         evicted_controlled_key = getattr(result, "evicted_controlled_key", None)
         evicted_uncontrolled_key = getattr(result, "evicted_uncontrolled_key", None)
         # Only count keys that leave the whole cache system.
@@ -718,6 +721,7 @@ def _run_ttl_method(
         wrong_eviction_count=wrong_eviction_count,
         avg_query_count_after_eviction=avg_query_count_after_eviction,
         api_call_reduction_pct_vs_lru=api_call_reduction * 100.0,
+        admission_scores=admission_scores,
     )
 
 
@@ -821,9 +825,15 @@ def run_ttl_method_eval(
     print(f"Built truth price lookup for {len(truth_price_by_key)} unique cache keys")
 
     lru_summary = _run_lru_baseline(source_df, truth_price_by_key=truth_price_by_key, lru_capacity=lru_capacity)
-    print(f"Completed LRU baseline evaluation: {lru_summary}")
+    print(
+        "Completed LRU baseline evaluation: "
+        f"hit_rate={lru_summary.hit_rate:.4f}, "
+        f"provider_calls={lru_summary.provider_calls}, "
+        f"stale_rate={lru_summary.stale_rate_served_pct:.4f}, "
+        f"evictions={lru_summary.eviction_count}"
+    )
 
-    ttl_methods = ["glm","pp","km","rule_based"]
+    ttl_methods = ["pp"]
     evals: List[EvalSummary] = []
     ttl_lookups: Dict[str, Dict[str, int]] = {}
     admission_states: Dict[str, Dict[str, Any]] = {}
@@ -870,7 +880,14 @@ def run_ttl_method_eval(
                 prefetch_ratio=prefetch_ratio,
             )
         )
-        print(f"Completed TTL method evaluation for {method.upper()}: {evals[-1]}")
+        latest = evals[-1]
+        print(
+            f"Completed TTL method evaluation for {method.upper()}: "
+            f"hit_rate={latest.hit_rate:.4f}, "
+            f"provider_calls={latest.provider_calls}, "
+            f"stale_rate={latest.stale_rate_served_pct:.4f}, "
+            f"evictions={latest.eviction_count}"
+        )
 
     lines.append("TTL METHOD EVAL (admission score uses TTL-implied lambda)")
 
@@ -926,6 +943,7 @@ def run_ttl_method_eval(
             lines.append(f"  {bucket}: {ttl if ttl is not None else 'NA'}")
         lines.append("distribution:")
         lines.extend([f"  {x}" for x in _format_distribution_lines(method_lambda_dist.get(summary.ttl_method, []), "lambda_i")])
+        lines.extend([f"  {x}" for x in _format_distribution_lines(summary.admission_scores, "admission_score")])
         lines.extend([f"  {x}" for x in _format_distribution_lines(method_ttl_dist.get(summary.ttl_method, []), "ttl_seconds")])
         lines.append("")
 

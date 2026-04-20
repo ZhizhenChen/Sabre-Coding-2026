@@ -355,6 +355,7 @@ class SabreCacheWorkflow:
             return int(max(self.min_ttl_seconds, min(self.max_ttl_seconds, lookup_ttl)))
         return self._compute_ttl_from_freshness(lambda_i, self.target_freshness_controlled)
 
+
     def _compute_uncontrolled_ttl(
         self,
         request: RequestContext,
@@ -682,55 +683,3 @@ class SabreCacheWorkflow:
                 "theta": self._theta,
                 "score_history_size": len(self._score_history),
             }
-
-
-if __name__ == "__main__":
-    workflow = SabreCacheWorkflow(
-        controlled_capacity=2,
-        uncontrolled_capacity=4,
-        score_percentile=0.8,
-    )
-
-    req = RequestContext(
-        rq_timestamp=_utc_now(),
-        chain_code="HY",
-        stay_start_date="2026-05-01",
-        stay_end_date="2026-05-03",
-        duration=2,
-        city_code="DFW",
-        hotel_code="H100",
-    )
-
-    def fake_provider(r: RequestContext) -> Dict[str, Any]:
-        return {
-            "request_key": r.cache_key(),
-            "offers": [
-                {"hotel_id": "H100", "price": 199.0},
-                {"hotel_id": "H210", "price": 229.0},
-            ],
-            "fetched_at": _utc_now().isoformat(),
-        }
-
-    first = workflow.get(req, p_reuse=0.92, lambda_i=0.20, provider=fake_provider)
-    second = workflow.get(req, p_reuse=0.92, lambda_i=0.20, provider=fake_provider)
-
-    prefetch_keys = workflow.prefetch_controlled(
-        candidates=[
-            (
-                RequestContext(_utc_now(), "HY", "2026-06-01", "2026-06-02", 1, "NYC", hotel_code="H101"),
-                0.95,
-                0.90,
-            ),
-            (
-                RequestContext(_utc_now(), "MC", "2026-06-05", "2026-06-07", 2, "DFW", hotel_code="H102"),
-                0.77,
-                0.65,
-            ),
-        ],
-        provider=fake_provider,
-    )
-
-    print("First call:", first)
-    print("Second call:", second)
-    print("Prefetched keys:", prefetch_keys)
-    print("Stats:", workflow.stats())
