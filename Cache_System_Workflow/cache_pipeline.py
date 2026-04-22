@@ -833,7 +833,7 @@ def run_ttl_method_eval(
         f"evictions={lru_summary.eviction_count}"
     )
 
-    ttl_methods = ["pp"]
+    ttl_methods = ["glm"]
     evals: List[EvalSummary] = []
     ttl_lookups: Dict[str, Dict[str, int]] = {}
     admission_states: Dict[str, Dict[str, Any]] = {}

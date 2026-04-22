@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 import heapq
 import math
 import threading
+import numpy as np
 from typing import Any, Callable, Deque, Dict, List, Optional, Protocol, Tuple
 
 
@@ -174,6 +175,7 @@ class SabreCacheWorkflow:
         uncontrolled_capacity: int = 5000,
         score_percentile: float = 0.8,
         score_history_size: int = 10000,
+        # theta_window_size: Optional[int] = None,
         score_lambda_floor: float = 0.01,
         ttl_lambda_floor: float = 0.05,
         min_ttl_seconds: int = 60,
@@ -199,6 +201,13 @@ class SabreCacheWorkflow:
         self.controlled_capacity = controlled_capacity
         self.uncontrolled_capacity = uncontrolled_capacity
         self.score_percentile = score_percentile
+        self.score_history_size = max(1, int(score_history_size))
+        # self.theta_window_size = (
+        #     self.score_history_size
+        #     if theta_window_size is None
+        #     else max(1, int(theta_window_size))
+        # )
+        # self.theta_min_samples = max(1, min(200, self.theta_window_size))
         self.score_lambda_floor = score_lambda_floor
         self.ttl_lambda_floor = ttl_lambda_floor
         self.min_ttl_seconds = min_ttl_seconds
@@ -226,7 +235,7 @@ class SabreCacheWorkflow:
         self._controlled: OrderedDict[str, CacheEntry] = OrderedDict()
         self._controlled_min_heap: List[Tuple[float, str]] = []
         self._uncontrolled: OrderedDict[str, CacheEntry] = OrderedDict()
-        self._score_history: Deque[float] = deque(maxlen=score_history_size)
+        self._score_history: Deque[float] = deque(maxlen=self.score_history_size)
         self._theta: float = 0.0
         self._provider_call_counts: Dict[str, int] = {"refresh": 0, "prefetch": 0, "miss": 0}
         self._last_stay_date_purge_date: Optional[str] = None
@@ -269,6 +278,7 @@ class SabreCacheWorkflow:
     def _compute_score(self, p_reuse: float, lambda_i: float) -> float:
         safe_lambda = max(float(lambda_i), self.score_lambda_floor)
         return p_reuse / safe_lambda
+                          
 
     def _lead_time_days(self, request: RequestContext, now: datetime) -> int:
         if request.lead_time_days is not None:
@@ -372,8 +382,15 @@ class SabreCacheWorkflow:
         return self._compute_ttl_from_freshness(lambda_i, self.target_freshness_uncontrolled)
 
     def _update_theta(self, score: float) -> float:
+        # Compute theta from an explicit rolling window (excluding current score),
+        # then append current score for subsequent requests.
+        history = list(self._score_history)
+        window_history = history[-1000 :]
+        if len(window_history) < 200:
+            self._theta = 0.0
+        else:
+            self._theta = _percentile(window_history, self.score_percentile)
         self._score_history.append(score)
-        self._theta = _percentile(list(self._score_history), self.score_percentile)
         return self._theta
 
     def _touch_entry(self, entry: CacheEntry, now: datetime) -> None:

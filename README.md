@@ -59,6 +59,8 @@ Provider payload is request-keyed and source-aware:
 Report includes:
 - `hit_rate`
 - `provider_total_calls`
+- `provider_refresh_calls`
+- `provider_prefetch_calls`
 - `api_call_reduction_pct_vs_lru`
 - `stale_rate_served_pct`
 - `prewarm_precision`
